@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <OutputType>Library</OutputType>
+    <RootNamespace>Cadastre_Calculator</RootNamespace>
+    <AssemblyName>CadastreTools</AssemblyName>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="AutoCAD.NET" Version="25.1.0" PrivateAssets="All" />
+    <PackageReference Include="AutoCAD.NET.Core" Version="25.1.0" PrivateAssets="All" />
+    <PackageReference Include="AutoCAD.NET.Model" Version="25.1.0" PrivateAssets="All" />
+    <PackageReference Include="System.Text.Json" Version="9.0.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="Tests\**" />
+    <Compile Remove="Class1.cs" />
+    <Page Remove="Tests\**" />
+    <Resource Remove="Tests\**" />
+  </ItemGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
+    <StartAction>Program</StartAction>
+    <StartProgram>C:\Program Files\Autodesk\AutoCAD 2025\acad.exe</StartProgram>
+  </PropertyGroup>
+
+</Project>
