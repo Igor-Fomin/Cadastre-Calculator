@@ -404,17 +404,24 @@ namespace CadastreTools
     {
         public static double ParseDmsToDegrees(double rawInput)
         {
-            int degrees = (int)rawInput; double decimals = rawInput - degrees;
-            string decimalStr = decimals.ToString("F6").Substring(2).PadRight(6, '0');
-            double minutes = double.Parse(decimalStr.Substring(0, 2));
-            double seconds = double.Parse(decimalStr.Substring(2, 2) + "." + decimalStr.Substring(4));
-            return degrees + (minutes / 60.0) + (seconds / 3600.0);
+            // rawInput is DDD.MMSSssss
+            double d = Math.Floor(rawInput + 0.000000001);
+            double rest = (rawInput - d) * 100.0;
+            double m = Math.Floor(rest + 0.000000001);
+            double s = (rest - m) * 100.0;
+            return d + (m / 60.0) + (s / 3600.0);
         }
         public static string DegreesToDmsFormatted(double decimalDegrees)
         {
-            int d = (int)decimalDegrees; double remainder = (decimalDegrees - d) * 60.0;
-            int m = (int)remainder; double s = (remainder - m) * 60.0;
-            return $"{d}\u00B0{m:00}'{Math.Round(s):00}\"";
+            // Handle negative values if any
+            double totalSeconds = Math.Round(decimalDegrees * 3600.0);
+            int d = (int)(totalSeconds / 3600);
+            int m = (int)((totalSeconds % 3600) / 60);
+            int s = (int)(totalSeconds % 60);
+
+            // AutoCAD standard degree symbol is \U+00B0 but for simple text %%d or \u00B0 works.
+            // Using user's preference for 'd' if needed, but standard is \u00B0
+            return $"{d}\u00B0{m:00}'{s:00}\"";
         }
         public static string DmsToString(double dmsValue) { return dmsValue.ToString("0.0000"); }
         public static string DegreesToDmsString(double decimalDegrees)
