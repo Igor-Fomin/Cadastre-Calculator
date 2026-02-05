@@ -1644,7 +1644,7 @@ namespace CadastreTools
         }
         private void Input_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
         {
-            if (e.Key == Key.Enter) { e.Handled = true; if (sender == txtAzimuth) txtDistance.Focus(); else ExecuteManualDraw(); }
+            if (e.Key == Key.Enter) { e.Handled = true; if (sender == txtAzimuth) { txtDistance.Focus(); txtDistance.SelectAll(); } else ExecuteManualDraw(); }
             if (sender == txtAzimuth && double.TryParse(txtAzimuth.Text, out double c))
             {
                 double dec = CadMath.ParseDmsToDegrees(c);
