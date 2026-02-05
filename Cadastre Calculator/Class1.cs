@@ -135,21 +135,34 @@ namespace CadastreTools
     // --- 4. PERSISTENCE ENGINE (UPDATED TO USE XML FILE) ---
     public static class PersistenceManager
     {
+        public static string GetDwgPath(Document doc)
+        {
+            if (doc == null) return "";
+            string path = doc.Database.Filename;
+            if (string.IsNullOrEmpty(path) || (!path.Contains("\\") && !path.Contains("/")))
+            {
+                path = doc.Name;
+            }
+            return path;
+        }
+
         // SAVE: Writes the complex object structure to a file
         public static void SaveToDwg(List<TraverseChain> traverses)
         {
+            var doc = AcApp.DocumentManager.MdiActiveDocument;
+            if (doc == null) return;
+
             try
             {
-                // 1. Get current drawing path
-                var doc = AcApp.DocumentManager.MdiActiveDocument;
-                string dwgPath = doc.Name;
-
-                // Safety: Don't save if drawing hasn't been saved to disk yet
-                if (string.IsNullOrEmpty(dwgPath) || !dwgPath.Contains("\\")) return;
+                string dwgPath = GetDwgPath(doc);
+                if (string.IsNullOrEmpty(dwgPath) || (!dwgPath.Contains("\\") && !dwgPath.Contains("/")))
+                {
+                    doc.Editor.WriteMessage("\n[Cadastre] Save skipped: Drawing not saved to disk.");
+                    return;
+                }
 
                 string xmlFile = dwgPath + ".database.xml";
 
-                // 2. Convert Runtime Objects (TraverseChain) to Saveable Data (Dto)
                 DtoSaveData data = new DtoSaveData();
                 foreach (var t in traverses)
                 {
@@ -159,16 +172,17 @@ namespace CadastreTools
                     data.Chains.Add(dt);
                 }
 
-                // 3. Write to XML File
                 XmlSerializer xs = new XmlSerializer(typeof(DtoSaveData));
-                using (StreamWriter wr = new StreamWriter(xmlFile))
+                using (var fs = new FileStream(xmlFile, FileMode.Create, FileAccess.Write, FileShare.ReadWrite))
+                using (StreamWriter wr = new StreamWriter(fs))
                 {
                     xs.Serialize(wr, data);
                 }
+                doc.Editor.WriteMessage("\n[Cadastre] Data saved to: " + Path.GetFileName(xmlFile));
             }
             catch (System.Exception ex)
             {
-                // Optional: AcApp.DocumentManager.MdiActiveDocument.Editor.WriteMessage("\nSave Error: " + ex.Message);
+                doc.Editor.WriteMessage("\n[Cadastre] Save Error: " + ex.Message);
             }
         }
 
@@ -176,23 +190,32 @@ namespace CadastreTools
         public static List<TraverseChain> LoadFromDwg()
         {
             List<TraverseChain> list = new List<TraverseChain>();
+            var doc = AcApp.DocumentManager.MdiActiveDocument;
+            if (doc == null) return list;
+
             try
             {
-                var doc = AcApp.DocumentManager.MdiActiveDocument;
-                string dwgPath = doc.Name;
-                if (string.IsNullOrEmpty(dwgPath) || !File.Exists(dwgPath + ".database.xml")) return list;
-
+                string dwgPath = GetDwgPath(doc);
                 string xmlFile = dwgPath + ".database.xml";
-                DtoSaveData data;
 
-                // 1. Read from XML File
+                doc.Editor.WriteMessage("\n[Cadastre] Looking for DB at: " + xmlFile);
+
+                if (string.IsNullOrEmpty(dwgPath) || !File.Exists(xmlFile)) 
+                {
+                    doc.Editor.WriteMessage("\n[Cadastre] No database file found.");
+                    return list;
+                }
+
+                DtoSaveData data;
                 XmlSerializer xs = new XmlSerializer(typeof(DtoSaveData));
-                using (StreamReader rd = new StreamReader(xmlFile))
+                using (var fs = new FileStream(xmlFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (StreamReader rd = new StreamReader(fs))
                 {
                     data = (DtoSaveData)xs.Deserialize(rd);
                 }
 
-                // 2. Convert Saveable Data (Dto) back to Runtime Objects (TraverseChain)
+                if (data == null || data.Chains == null) return list;
+
                 Database db = doc.Database;
                 foreach (var dc in data.Chains)
                 {
@@ -201,8 +224,13 @@ namespace CadastreTools
                     foreach (var dr in dc.Radiations) tc.Radiations.Add(RebuildSeg(dr, db));
                     list.Add(tc);
                 }
+                
+                doc.Editor.WriteMessage("\n[Cadastre] Loaded " + list.Count + " traverses.");
             }
-            catch { }
+            catch (System.Exception ex)
+            {
+                doc.Editor.WriteMessage("\n[Cadastre] Load Error: " + ex.Message);
+            }
             return list;
         }
 
@@ -324,6 +352,31 @@ namespace CadastreTools
     // --- 6. MATH UTILS ---
     public static class DwgDataManager
     {
+        public static int GetMaxPointNumber(Transaction tr, Database db)
+        {
+            int max = 0;
+            BlockTable bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            BlockTableRecord btr = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+            foreach (ObjectId id in btr)
+            {
+                if (id.ObjectClass.IsDerivedFrom(RXClass.GetClass(typeof(DBText))) ||
+                    id.ObjectClass.IsDerivedFrom(RXClass.GetClass(typeof(MText))))
+                {
+                    Entity ent = (Entity)tr.GetObject(id, OpenMode.ForRead);
+                    if (ent.Layer == CadConstants.LAY_TXT_PTNUM)
+                    {
+                        string txt = (ent is DBText dbt) ? dbt.TextString : ((MText)ent).Contents;
+                        if (int.TryParse(txt, out int num))
+                        {
+                            if (num > max) max = num;
+                        }
+                    }
+                }
+            }
+            return max;
+        }
+
         public static bool IsPointNumberAtLocation(Point3d pt, Transaction tr, Database db)
         {
             // Simple check if a point number text already exists near this location
@@ -542,6 +595,7 @@ namespace CadastreTools
                 InitializeCustomUI();
                 this.Loaded += OnControlLoaded;
                 AcApp.DocumentManager.DocumentActivated += (s, e) => ResetForNewDocument();
+                AcApp.DocumentManager.DocumentCreated += (s, e) => ResetForNewDocument();
             }
             catch (System.Exception ex)
             {
@@ -554,6 +608,7 @@ namespace CadastreTools
             try
             {
                 if (AcApp.DocumentManager.MdiActiveDocument == null) return;
+                AcApp.DocumentManager.MdiActiveDocument.Editor.WriteMessage("\n[Cadastre] Interface Loaded.");
                 PopulateComboBoxes();
                 UpdateUIFromConfig();
                 HighlightActiveLayer(btnW);
@@ -568,7 +623,8 @@ namespace CadastreTools
         {
             _allTraverses.Clear(); _logItems.Clear(); _undoStack.Clear(); _traversePath.Clear();
             _currentTraverse = null;
-            lblStatus.Content = "Document Switched. Loading...";
+            _lastPtNum = 0; // RESET
+            if (lblStatus != null) lblStatus.Content = "Document Switched. Loading...";
             ReloadDataFromDwg();
             UpdateGuideText("PICK START POINT");
         }
@@ -577,21 +633,37 @@ namespace CadastreTools
         {
             var loaded = PersistenceManager.LoadFromDwg();
             _allTraverses.Clear(); _logItems.Clear();
+            
             if (loaded.Count > 0)
             {
                 _allTraverses.AddRange(loaded);
                 foreach (var t in _allTraverses)
                 {
-                    // Populate Log in reverse order (newest top)
-                    // Actually, let's just dump all segments
                     foreach (var s in t.Segments) _logItems.Add(s);
                     foreach (var r in t.Radiations) _logItems.Add(r);
                 }
-                // Sort Log by ID desc? No, let's keep it simple
                 RefreshTraverseList();
-                SyncCurrentState();
-                lblStatus.Content = "Data Loaded from DWG.";
+                if (lblStatus != null) lblStatus.Content = "Data Loaded from DWG.";
             }
+            else
+            {
+                // FALLBACK: Try to find highest point number in drawing if XML is missing
+                var doc = AcApp.DocumentManager.MdiActiveDocument;
+                if (doc != null)
+                {
+                    using (var tr = doc.TransactionManager.StartTransaction())
+                    {
+                        _lastPtNum = DwgDataManager.GetMaxPointNumber(tr, doc.Database);
+                        tr.Commit();
+                    }
+                    if (_lastPtNum > 0 && lblStatus != null) 
+                        lblStatus.Content = "No DB file. Scanned drawing for Point #" + _lastPtNum;
+                    else if (lblStatus != null)
+                        lblStatus.Content = "New Drawing / No Data.";
+                }
+            }
+            
+            SyncCurrentState();
         }
 
         private void SyncCurrentState()
@@ -619,6 +691,7 @@ namespace CadastreTools
             {
                 _currentTraverse = null;
                 _traversePath.Clear();
+                // Note: _lastPtNum might have been set by the fallback scan in ReloadDataFromDwg
             }
         }
 
@@ -646,13 +719,16 @@ namespace CadastreTools
             header.ColumnDefinitions.Add(new ColumnDefinition() { Width = new GridLength(1, GridUnitType.Star) });
             header.ColumnDefinitions.Add(new ColumnDefinition() { Width = GridLength.Auto });
             header.ColumnDefinitions.Add(new ColumnDefinition() { Width = GridLength.Auto });
+            header.ColumnDefinitions.Add(new ColumnDefinition() { Width = GridLength.Auto });
             TextBlock title = new TextBlock() { Text = " CADASTRE PRO", VerticalAlignment = VerticalAlignment.Center, Foreground = System.Windows.Media.Brushes.White, FontWeight = FontWeights.Bold, FontSize = 18, Margin = new Thickness(10, 0, 0, 0) };
+            Wpf.Button btnReload = new Wpf.Button() { Content = "↻", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.Cyan, BorderThickness = new Thickness(0), FontSize = 24, ToolTip = "Reload Database from XML", FontWeight = FontWeights.Bold };
+            btnReload.Click += (s, e) => ReloadDataFromDwg();
             Wpf.Button btnSettings = new Wpf.Button() { Content = "?", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.White, BorderThickness = new Thickness(0), FontSize = 20 };
             btnSettings.Click += (s, e) => ShowSettingsOverlay();
             Wpf.Button btnAbout = new Wpf.Button() { Content = "?", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.White, BorderThickness = new Thickness(0), FontSize = 20 };
             btnAbout.Click += (s, e) => System.Windows.MessageBox.Show("Cadastre Pro V3.5\nData Persistence Active");
-            Grid.SetColumn(title, 0); Grid.SetColumn(btnSettings, 1); Grid.SetColumn(btnAbout, 2);
-            header.Children.Add(title); header.Children.Add(btnSettings); header.Children.Add(btnAbout);
+            Grid.SetColumn(title, 0); Grid.SetColumn(btnReload, 1); Grid.SetColumn(btnSettings, 2); Grid.SetColumn(btnAbout, 3);
+            header.Children.Add(title); header.Children.Add(btnReload); header.Children.Add(btnSettings); header.Children.Add(btnAbout);
             Grid.SetRow(header, 0); mainGrid.Children.Add(header);
 
             // INPUTS
