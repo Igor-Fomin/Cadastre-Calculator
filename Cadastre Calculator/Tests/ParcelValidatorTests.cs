@@ -22,7 +22,8 @@ namespace Cadastre_Calculator.Tests
             // Simulate GetObject returning our mock polyline
             // We use an arbitrary object as the ID since the interface uses 'object'
             object fakeId = new object(); 
-            mockTransaction.Setup(tr => tr.GetObject(fakeId)).Returns(mockPolyline.Object);
+            // Explicitly provide the optional argument to avoid Moq/expression tree issues
+            mockTransaction.Setup(tr => tr.GetObject(fakeId, false)).Returns(mockPolyline.Object);
 
             var validator = new ParcelValidator();
 
@@ -30,7 +31,7 @@ namespace Cadastre_Calculator.Tests
             bool result = validator.ValidateParcelArea(mockTransaction.Object, fakeId);
 
             // Assert
-            Assert.IsFalse(result, "Validator should return false for area < 500");
+            Assert.That(result, Is.False, "Validator should return false for area < 500");
         }
     }
 }

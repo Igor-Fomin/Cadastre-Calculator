@@ -1,7 +1,7 @@
-<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2000/xaml/presentation"
-                    xmlns:x="http://schemas.microsoft.com/winfx/2000/xaml">
-    <SolidColorBrush x:Key="WindowBackgroundBrush" Color="#F5F5F5" />
-    <SolidColorBrush x:Key="ControlBackgroundBrush" Color="#FFFFFF" />
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <SolidColorBrush x:Key="WindowBackgroundBrush" Color="#FFFFFF" />
+    <SolidColorBrush x:Key="ControlBackgroundBrush" Color="#F5F5F5" />
     <SolidColorBrush x:Key="TextBrush" Color="#000000" />
     <SolidColorBrush x:Key="BorderBrush" Color="#CCCCCC" />
 </ResourceDictionary>
