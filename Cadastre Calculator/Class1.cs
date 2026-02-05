@@ -135,14 +135,21 @@ namespace CadastreTools
     // --- 4. PERSISTENCE ENGINE (UPDATED TO USE XML FILE) ---
     public static class PersistenceManager
     {
-        public static string GetDwgPath(Document doc)
+        public static string? GetDwgPath(Document doc)
         {
-            if (doc == null) return "";
+            if (doc == null) return null;
             string path = doc.Database.Filename;
             if (string.IsNullOrEmpty(path) || (!path.Contains("\\") && !path.Contains("/")))
             {
-                path = doc.Name;
+                return null;
             }
+
+            string lower = path.ToLower();
+            if (lower.EndsWith(".dwt") || lower.Contains("appdata") || lower.Contains("template"))
+            {
+                return null;
+            }
+
             return path;
         }
 
@@ -154,10 +161,9 @@ namespace CadastreTools
 
             try
             {
-                string dwgPath = GetDwgPath(doc);
-                if (string.IsNullOrEmpty(dwgPath) || (!dwgPath.Contains("\\") && !dwgPath.Contains("/")))
+                string? dwgPath = GetDwgPath(doc);
+                if (dwgPath == null)
                 {
-                    doc.Editor.WriteMessage("\n[Cadastre] Save skipped: Drawing not saved to disk.");
                     return;
                 }
 
@@ -195,12 +201,18 @@ namespace CadastreTools
 
             try
             {
-                string dwgPath = GetDwgPath(doc);
+                string? dwgPath = GetDwgPath(doc);
+                if (dwgPath == null)
+                {
+                    doc.Editor.WriteMessage("\n[Cadastre] New/Unsaved drawing detected. Starting fresh.");
+                    return list;
+                }
+
                 string xmlFile = dwgPath + ".database.xml";
 
                 doc.Editor.WriteMessage("\n[Cadastre] Looking for DB at: " + xmlFile);
 
-                if (string.IsNullOrEmpty(dwgPath) || !File.Exists(xmlFile)) 
+                if (!File.Exists(xmlFile)) 
                 {
                     doc.Editor.WriteMessage("\n[Cadastre] No database file found.");
                     return list;
@@ -591,6 +603,7 @@ namespace CadastreTools
         private Wpf.ComboBox cmbLayQ, cmbLayW, cmbLayE, cmbLayA, cmbLayS, cmbLayD, cmbSound;
         private Wpf.CheckBox setChkAudio;
         private List<TextUiRow> _textUiRows = new List<TextUiRow>();
+        private Database? _hookedDb = null;
         private class TextUiRow { public Wpf.ComboBox CmbStyle; public Wpf.TextBox TxtSize; public Wpf.Button BtnColor; public Wpf.CheckBox ChkMText; public Wpf.CheckBox ChkMask; public Wpf.CheckBox ChkVisible; public TextSettings SettingsRef; public string AssociatedLayer; }
 
         public CadastreControl()
@@ -628,12 +641,31 @@ namespace CadastreTools
 
         private void ResetForNewDocument()
         {
-            _allTraverses.Clear(); _logItems.Clear(); _undoStack.Clear(); _traversePath.Clear();
+            var doc = AcApp.DocumentManager.MdiActiveDocument;
+            if (doc != null)
+            {
+                if (_hookedDb != null)
+                {
+                    try { _hookedDb.SaveComplete -= Database_SaveComplete; } catch { }
+                }
+                _hookedDb = doc.Database;
+                _hookedDb.SaveComplete += Database_SaveComplete;
+            }
+
+            _allTraverses.Clear(); 
+            _logItems.Clear(); 
+            _undoStack.Clear(); 
+            _traversePath.Clear();
             _currentTraverse = null;
             _lastPtNum = 0; // RESET
             if (lblStatus != null) lblStatus.Content = "Document Switched. Loading...";
             ReloadDataFromDwg();
             UpdateGuideText("PICK START POINT");
+        }
+
+        private void Database_SaveComplete(object sender, EventArgs e)
+        {
+            SaveState();
         }
 
         private void ReloadDataFromDwg()
