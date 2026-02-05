@@ -1280,10 +1280,13 @@ namespace CadastreTools
             {
                 try
                 {
-                    int idx = _currentTraverse.Segments.IndexOf(refSeg);
+                    var chain = _allTraverses.FirstOrDefault(t => t.Id == refSeg.TraverseId);
+                    if (chain == null) return;
+
+                    int idx = chain.Segments.IndexOf(refSeg);
                     if (!before) idx++;
 
-                    Point3d start = (idx == 0) ? _currentTraverse.OriginPoint : _currentTraverse.Segments[idx - 1].EndPoint;
+                    Point3d start = (idx == 0) ? chain.OriginPoint : chain.Segments[idx - 1].EndPoint;
                     double rad = (90.0 - CadMath.ParseDmsToDegrees(az)) * (Math.PI / 180.0);
                     Point3d end = new Point3d(start.X + (dist * Math.Cos(rad)), start.Y + (dist * Math.Sin(rad)), start.Z);
                     Vector3d shift = end - start;
@@ -1296,12 +1299,12 @@ namespace CadastreTools
                     Entity ptTxt = CreateText("0", CadConstants.LAY_TXT_PTNUM, end, AttachmentPoint.BottomLeft, tr, doc.Database, _config.TextPt);
                     ObjectId pId = AddToDb(ptTxt, btr, tr);
 
-                    TraverseSegment newSeg = new TraverseSegment() { TraverseId = _currentTraverse.Id, RawAzimuth = az, Distance = dist, StartPoint = start, EndPoint = end, LineId = lId, TextBrgId = txts[0], TextDistId = txts[1], TextPtId = pId };
-                    _currentTraverse.Segments.Insert(idx, newSeg);
+                    TraverseSegment newSeg = new TraverseSegment() { TraverseId = chain.Id, RawAzimuth = az, Distance = dist, StartPoint = start, EndPoint = end, LineId = lId, TextBrgId = txts[0], TextDistId = txts[1], TextPtId = pId };
+                    chain.Segments.Insert(idx, newSeg);
                     _logItems.Insert(_logItems.IndexOf(refSeg) + (before ? 0 : 1), newSeg);
 
                     PropagateShift(newSeg, Matrix3d.Displacement(shift), tr);
-                    RenumberTraversePoints(_currentTraverse, tr);
+                    RenumberTraversePoints(chain, tr);
                     tr.Commit(); doc.Editor.Regen();
                 }
                 catch { }
@@ -1357,19 +1360,22 @@ namespace CadastreTools
             {
                 try
                 {
+                    var chain = _allTraverses.FirstOrDefault(t => t.Id == seg.TraverseId);
+                    if (chain == null) return;
+
                     EraseId(seg.LineId, tr); EraseId(seg.TextBrgId, tr); EraseId(seg.TextDistId, tr); EraseId(seg.TextPtId, tr); EraseId(seg.TextCommId, tr);
                     _logItems.Remove(seg);
 
                     if (seg.IsRadiation)
                     {
-                        _currentTraverse.Radiations.Remove(seg);
+                        chain.Radiations.Remove(seg);
                     }
                     else
                     {
                         Vector3d delta = seg.StartPoint - seg.EndPoint;
                         PropagateShift(seg, Matrix3d.Displacement(delta), tr);
-                        _currentTraverse.Segments.Remove(seg);
-                        RenumberTraversePoints(_currentTraverse, tr);
+                        chain.Segments.Remove(seg);
+                        RenumberTraversePoints(chain, tr);
                     }
                     tr.Commit(); doc.Editor.Regen();
                 }
@@ -1381,17 +1387,18 @@ namespace CadastreTools
 
         private void PropagateShift(TraverseSegment seg, Matrix3d matMove, Transaction tr)
         {
-            if (_currentTraverse != null)
+            var chain = _allTraverses.FirstOrDefault(t => t.Id == seg.TraverseId);
+            if (chain != null)
             {
-                int idx = _currentTraverse.Segments.IndexOf(seg);
+                int idx = chain.Segments.IndexOf(seg);
                 if (idx == -1) return;
-                for (int i = idx + 1; i < _currentTraverse.Segments.Count; i++)
+                for (int i = idx + 1; i < chain.Segments.Count; i++)
                 {
-                    var sub = _currentTraverse.Segments[i];
+                    var sub = chain.Segments[i];
                     sub.StartPoint = sub.StartPoint.TransformBy(matMove); sub.EndPoint = sub.EndPoint.TransformBy(matMove);
                     TransformEntity(sub.LineId, matMove, tr); TransformEntity(sub.TextBrgId, matMove, tr); TransformEntity(sub.TextDistId, matMove, tr); TransformEntity(sub.TextPtId, matMove, tr); TransformEntity(sub.TextCommId, matMove, tr);
 
-                    foreach (var rad in _currentTraverse.Radiations)
+                    foreach (var rad in chain.Radiations)
                     {
                         if (rad.ParentStationId == sub.FromPoint)
                         {
