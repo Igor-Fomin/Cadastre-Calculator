@@ -786,15 +786,18 @@ namespace CadastreTools
             header.ColumnDefinitions.Add(new ColumnDefinition() { Width = GridLength.Auto });
             header.ColumnDefinitions.Add(new ColumnDefinition() { Width = GridLength.Auto });
             header.ColumnDefinitions.Add(new ColumnDefinition() { Width = GridLength.Auto });
+            header.ColumnDefinitions.Add(new ColumnDefinition() { Width = GridLength.Auto });
             TextBlock title = new TextBlock() { Text = " CADASTRE PRO", VerticalAlignment = VerticalAlignment.Center, Foreground = System.Windows.Media.Brushes.White, FontWeight = FontWeights.Bold, FontSize = 18, Margin = new Thickness(10, 0, 0, 0) };
             Wpf.Button btnReload = new Wpf.Button() { Content = "↻", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.Cyan, BorderThickness = new Thickness(0), FontSize = 24, ToolTip = "Reload Database from XML", FontWeight = FontWeights.Bold };
             btnReload.Click += (s, e) => ReloadDataFromDwg();
+            Wpf.Button btnRedraft = new Wpf.Button() { Content = "✎", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.Yellow, BorderThickness = new Thickness(0), FontSize = 24, ToolTip = "Redraft Missing Entities", FontWeight = FontWeights.Bold };
+            btnRedraft.Click += RedraftTraverses_Click;
             Wpf.Button btnSettings = new Wpf.Button() { Content = "?", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.White, BorderThickness = new Thickness(0), FontSize = 20 };
             btnSettings.Click += (s, e) => ShowSettingsOverlay();
             Wpf.Button btnAbout = new Wpf.Button() { Content = "?", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.White, BorderThickness = new Thickness(0), FontSize = 20 };
             btnAbout.Click += (s, e) => System.Windows.MessageBox.Show("Cadastre Pro V3.5\nData Persistence Active");
-            Grid.SetColumn(title, 0); Grid.SetColumn(btnReload, 1); Grid.SetColumn(btnSettings, 2); Grid.SetColumn(btnAbout, 3);
-            header.Children.Add(title); header.Children.Add(btnReload); header.Children.Add(btnSettings); header.Children.Add(btnAbout);
+            Grid.SetColumn(title, 0); Grid.SetColumn(btnReload, 1); Grid.SetColumn(btnRedraft, 2); Grid.SetColumn(btnSettings, 3); Grid.SetColumn(btnAbout, 4);
+            header.Children.Add(title); header.Children.Add(btnReload); header.Children.Add(btnRedraft); header.Children.Add(btnSettings); header.Children.Add(btnAbout);
             Grid.SetRow(header, 0); mainGrid.Children.Add(header);
 
             // INPUTS
@@ -895,6 +898,123 @@ namespace CadastreTools
             rootGrid.Children.Add(_overlayContainer);
             this.Content = rootGrid;
             this.PreviewKeyDown += Control_PreviewKeyDown;
+        }
+
+        private void RedraftTraverses_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                RedraftVisibleTraverses();
+                if (lblStatus != null) lblStatus.Content = "Redraft Complete.";
+            }
+            catch (System.Exception ex)
+            {
+                if (lblStatus != null) lblStatus.Content = "Redraft Error: " + ex.Message;
+            }
+        }
+
+        private void RedraftVisibleTraverses()
+        {
+            var doc = AcApp.DocumentManager.MdiActiveDocument;
+            using (DocumentLock loc = doc.LockDocument())
+            using (Transaction tr = doc.TransactionManager.StartTransaction())
+            {
+                BlockTableRecord btr = (BlockTableRecord)tr.GetObject(((BlockTable)tr.GetObject(doc.Database.BlockTableId, OpenMode.ForRead))[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+                EnsureLayerExists(_currentLayer, tr, doc.Database);
+
+                foreach (var chain in _allTraverses)
+                {
+                    // Process Segments
+                    foreach (var seg in chain.Segments)
+                    {
+                        // 1. Line
+                        if (seg.LineId.IsNull || seg.LineId.IsErased)
+                        {
+                            Autodesk.AutoCAD.DatabaseServices.Line ln = new Autodesk.AutoCAD.DatabaseServices.Line(seg.StartPoint, seg.EndPoint);
+                            ln.Layer = _currentLayer;
+                            seg.LineId = AddToDb(ln, btr, tr);
+                        }
+
+                        // 2. Annotations (Brg/Dist)
+                        if (seg.TextBrgId.IsNull || seg.TextBrgId.IsErased || seg.TextDistId.IsNull || seg.TextDistId.IsErased)
+                        {
+                            Autodesk.AutoCAD.DatabaseServices.Line lnObj;
+                            if (seg.LineId.IsValid && !seg.LineId.IsErased)
+                            {
+                                lnObj = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(seg.LineId, OpenMode.ForRead);
+                            }
+                            else
+                            {
+                                lnObj = new Autodesk.AutoCAD.DatabaseServices.Line(seg.StartPoint, seg.EndPoint);
+                            }
+
+                            double rad = (90.0 - CadMath.ParseDmsToDegrees(seg.RawAzimuth)) * (Math.PI / 180.0);
+                            EraseId(seg.TextBrgId, tr); 
+                            EraseId(seg.TextDistId, tr);
+
+                            var ids = CreateAnnotatedText(btr, tr, lnObj, seg.RawAzimuth, seg.Distance, rad);
+                            seg.TextBrgId = ids[0];
+                            seg.TextDistId = ids[1];
+                        }
+
+                        // 3. Point Number
+                        if (seg.TextPtId.IsNull || seg.TextPtId.IsErased)
+                        {
+                            Entity ptTxt = CreateText(seg.PointNumber.ToString(), CadConstants.LAY_TXT_PTNUM, seg.EndPoint, AttachmentPoint.BottomLeft, tr, doc.Database, _config.TextPt);
+                            seg.TextPtId = AddToDb(ptTxt, btr, tr);
+                        }
+
+                        // 4. Comment
+                        if ((seg.TextCommId.IsNull || seg.TextCommId.IsErased) && !string.IsNullOrEmpty(seg.Comment))
+                        {
+                             Entity txt = CreateText(seg.Comment, CadConstants.LAY_TXT_SYMB, seg.EndPoint, AttachmentPoint.MiddleLeft, tr, doc.Database, _config.TextComm);
+                             seg.TextCommId = AddToDb(txt, btr, tr);
+                        }
+                    }
+
+                    // Process Radiations
+                    foreach (var radSeg in chain.Radiations)
+                    {
+                        if (radSeg.LineId.IsNull || radSeg.LineId.IsErased)
+                        {
+                            Autodesk.AutoCAD.DatabaseServices.Line ln = new Autodesk.AutoCAD.DatabaseServices.Line(radSeg.StartPoint, radSeg.EndPoint);
+                            ln.Layer = _currentLayer;
+                            radSeg.LineId = AddToDb(ln, btr, tr);
+                        }
+
+                        if (radSeg.TextBrgId.IsNull || radSeg.TextBrgId.IsErased || radSeg.TextDistId.IsNull || radSeg.TextDistId.IsErased)
+                        {
+                            Autodesk.AutoCAD.DatabaseServices.Line lnObj;
+                            if (radSeg.LineId.IsValid && !radSeg.LineId.IsErased)
+                                lnObj = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(radSeg.LineId, OpenMode.ForRead);
+                            else
+                                lnObj = new Autodesk.AutoCAD.DatabaseServices.Line(radSeg.StartPoint, radSeg.EndPoint);
+
+                            double radAngle = (90.0 - CadMath.ParseDmsToDegrees(radSeg.RawAzimuth)) * (Math.PI / 180.0);
+                            EraseId(radSeg.TextBrgId, tr);
+                            EraseId(radSeg.TextDistId, tr);
+
+                            var ids = CreateAnnotatedText(btr, tr, lnObj, radSeg.RawAzimuth, radSeg.Distance, radAngle);
+                            radSeg.TextBrgId = ids[0];
+                            radSeg.TextDistId = ids[1];
+                        }
+
+                        if (radSeg.TextPtId.IsNull || radSeg.TextPtId.IsErased)
+                        {
+                            Entity ptTxt = CreateText(radSeg.PointNumber.ToString(), CadConstants.LAY_TXT_PTNUM, radSeg.EndPoint, AttachmentPoint.BottomLeft, tr, doc.Database, _config.TextPt);
+                            radSeg.TextPtId = AddToDb(ptTxt, btr, tr);
+                        }
+
+                        if ((radSeg.TextCommId.IsNull || radSeg.TextCommId.IsErased) && !string.IsNullOrEmpty(radSeg.Comment))
+                        {
+                             Entity txt = CreateText(radSeg.Comment, CadConstants.LAY_TXT_SYMB, radSeg.EndPoint, AttachmentPoint.MiddleLeft, tr, doc.Database, _config.TextComm);
+                             radSeg.TextCommId = AddToDb(txt, btr, tr);
+                        }
+                    }
+                }
+                tr.Commit();
+                doc.Editor.UpdateScreen();
+            }
         }
 
         private void RefreshTraverseList()
