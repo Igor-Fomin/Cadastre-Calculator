@@ -207,54 +207,25 @@ namespace CadastreTools
         // LOAD: Reads the file and reconstructs the objects for the UI
         public static List<TraverseChain> LoadFromDwg()
         {
-            List<TraverseChain> list = new List<TraverseChain>();
             var doc = AcApp.DocumentManager.MdiActiveDocument;
-            if (doc == null) return list;
+            if (doc == null) return new List<TraverseChain>();
 
-            try
+            string? dwgPath = GetDwgPath(doc);
+            if (dwgPath != null)
             {
-                DtoSaveData? data = null;
-                string? dwgPath = GetDwgPath(doc);
-
-                // 1. Try Load from XML File
-                if (dwgPath != null)
+                string xmlFile = dwgPath + ".database.xml";
+                if (File.Exists(xmlFile))
                 {
-                    string xmlFile = dwgPath + ".database.xml";
-                    if (File.Exists(xmlFile))
-                    {
-                        doc.Editor.WriteMessage("\n[Cadastre] Loading database from: " + xmlFile);
-                        XmlSerializer xs = new XmlSerializer(typeof(DtoSaveData));
-                        using (var fs = new FileStream(xmlFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                        using (StreamReader rd = new StreamReader(fs))
-                        {
-                            data = (DtoSaveData)xs.Deserialize(rd);
-                        }
-
-                        // Update Cache with fresh data from disk
-                        if (data != null)
-                        {
-                            _sessionCache[doc.Database.FingerprintGuid] = data;
-                        }
-                    }
+                    return LoadFromFile(xmlFile, doc);
                 }
+            }
 
-                // 2. Fallback to Session Cache
-                if (data == null)
-                {
-                     if (_sessionCache.ContainsKey(doc.Database.FingerprintGuid))
-                     {
-                         doc.Editor.WriteMessage("\n[Cadastre] Loading from session cache.");
-                         data = _sessionCache[doc.Database.FingerprintGuid];
-                     }
-                }
-
-                // 3. Rebuild Objects
-                if (data == null || data.Chains == null) 
-                {
-                    if (dwgPath != null) doc.Editor.WriteMessage("\n[Cadastre] No database found.");
-                    return list;
-                }
-
+            // Fallback to Session Cache
+            if (_sessionCache.ContainsKey(doc.Database.FingerprintGuid))
+            {
+                doc.Editor.WriteMessage("\n[Cadastre] Loading from session cache.");
+                DtoSaveData data = _sessionCache[doc.Database.FingerprintGuid];
+                List<TraverseChain> list = new List<TraverseChain>();
                 Database db = doc.Database;
                 foreach (var dc in data.Chains)
                 {
@@ -263,12 +234,43 @@ namespace CadastreTools
                     foreach (var dr in dc.Radiations) tc.Radiations.Add(RebuildSeg(dr, db));
                     list.Add(tc);
                 }
-                
-                doc.Editor.WriteMessage("\n[Cadastre] Loaded " + list.Count + " traverses.");
+                return list;
+            }
+
+            return new List<TraverseChain>();
+        }
+
+        public static List<TraverseChain> LoadFromFile(string filePath, Document doc)
+        {
+            List<TraverseChain> list = new List<TraverseChain>();
+            if (!File.Exists(filePath)) return list;
+
+            try
+            {
+                DtoSaveData data;
+                XmlSerializer xs = new XmlSerializer(typeof(DtoSaveData));
+                using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (StreamReader rd = new StreamReader(fs))
+                {
+                    data = (DtoSaveData)xs.Deserialize(rd);
+                }
+
+                if (data != null && data.Chains != null)
+                {
+                    _sessionCache[doc.Database.FingerprintGuid] = data;
+                    Database db = doc.Database;
+                    foreach (var dc in data.Chains)
+                    {
+                        TraverseChain tc = new TraverseChain() { ChainIndex = dc.ChainIndex, OriginPoint = new Point3d(dc.OriginX, dc.OriginY, dc.OriginZ) };
+                        foreach (var ds in dc.Segments) tc.Segments.Add(RebuildSeg(ds, db));
+                        foreach (var dr in dc.Radiations) tc.Radiations.Add(RebuildSeg(dr, db));
+                        list.Add(tc);
+                    }
+                }
             }
             catch (System.Exception ex)
             {
-                doc.Editor.WriteMessage("\n[Cadastre] Load Error: " + ex.Message);
+                doc.Editor.WriteMessage("\n[Cadastre] LoadFromFile Error: " + ex.Message);
             }
             return list;
         }
@@ -787,17 +789,20 @@ namespace CadastreTools
             header.ColumnDefinitions.Add(new ColumnDefinition() { Width = GridLength.Auto });
             header.ColumnDefinitions.Add(new ColumnDefinition() { Width = GridLength.Auto });
             header.ColumnDefinitions.Add(new ColumnDefinition() { Width = GridLength.Auto });
+            header.ColumnDefinitions.Add(new ColumnDefinition() { Width = GridLength.Auto });
             TextBlock title = new TextBlock() { Text = " CADASTRE PRO", VerticalAlignment = VerticalAlignment.Center, Foreground = System.Windows.Media.Brushes.White, FontWeight = FontWeights.Bold, FontSize = 18, Margin = new Thickness(10, 0, 0, 0) };
             Wpf.Button btnReload = new Wpf.Button() { Content = "↻", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.Cyan, BorderThickness = new Thickness(0), FontSize = 24, ToolTip = "Reload Database from XML", FontWeight = FontWeights.Bold };
             btnReload.Click += (s, e) => ReloadDataFromDwg();
             Wpf.Button btnRedraft = new Wpf.Button() { Content = "✎", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.Yellow, BorderThickness = new Thickness(0), FontSize = 24, ToolTip = "Redraft Missing Entities", FontWeight = FontWeights.Bold };
             btnRedraft.Click += RedraftTraverses_Click;
+            Wpf.Button btnConnect = new Wpf.Button() { Content = "🔗", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.LimeGreen, BorderThickness = new Thickness(0), FontSize = 20, ToolTip = "Connect Database File" };
+            btnConnect.Click += ConnectDatabase_Click;
             Wpf.Button btnSettings = new Wpf.Button() { Content = "?", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.White, BorderThickness = new Thickness(0), FontSize = 20 };
             btnSettings.Click += (s, e) => ShowSettingsOverlay();
             Wpf.Button btnAbout = new Wpf.Button() { Content = "?", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.White, BorderThickness = new Thickness(0), FontSize = 20 };
             btnAbout.Click += (s, e) => System.Windows.MessageBox.Show("Cadastre Pro V3.5\nData Persistence Active");
-            Grid.SetColumn(title, 0); Grid.SetColumn(btnReload, 1); Grid.SetColumn(btnRedraft, 2); Grid.SetColumn(btnSettings, 3); Grid.SetColumn(btnAbout, 4);
-            header.Children.Add(title); header.Children.Add(btnReload); header.Children.Add(btnRedraft); header.Children.Add(btnSettings); header.Children.Add(btnAbout);
+            Grid.SetColumn(title, 0); Grid.SetColumn(btnReload, 1); Grid.SetColumn(btnRedraft, 2); Grid.SetColumn(btnConnect, 3); Grid.SetColumn(btnSettings, 4); Grid.SetColumn(btnAbout, 5);
+            header.Children.Add(title); header.Children.Add(btnReload); header.Children.Add(btnRedraft); header.Children.Add(btnConnect); header.Children.Add(btnSettings); header.Children.Add(btnAbout);
             Grid.SetRow(header, 0); mainGrid.Children.Add(header);
 
             // INPUTS
@@ -898,6 +903,34 @@ namespace CadastreTools
             rootGrid.Children.Add(_overlayContainer);
             this.Content = rootGrid;
             this.PreviewKeyDown += Control_PreviewKeyDown;
+        }
+
+        private void ConnectDatabase_Click(object sender, RoutedEventArgs e)
+        {
+            Microsoft.Win32.OpenFileDialog ofd = new Microsoft.Win32.OpenFileDialog();
+            ofd.Filter = "XML Files (*.xml)|*.xml";
+            if (ofd.ShowDialog() == true)
+            {
+                var doc = AcApp.DocumentManager.MdiActiveDocument;
+                if (doc == null) return;
+                
+                var loaded = PersistenceManager.LoadFromFile(ofd.FileName, doc);
+                if (loaded.Count > 0)
+                {
+                    _allTraverses.Clear();
+                    _allTraverses.AddRange(loaded);
+                    _logItems.Clear();
+                    foreach (var t in _allTraverses)
+                    {
+                        foreach (var s in t.Segments) _logItems.Add(s);
+                        foreach (var r in t.Radiations) _logItems.Add(r);
+                    }
+                    RefreshTraverseList();
+                    SyncCurrentState();
+                    CalculateArea();
+                    if (lblStatus != null) lblStatus.Content = "Connected to " + Path.GetFileName(ofd.FileName);
+                }
+            }
         }
 
         private void RedraftTraverses_Click(object sender, RoutedEventArgs e)
