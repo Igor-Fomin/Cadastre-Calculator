@@ -75,6 +75,7 @@ namespace CadastreTools
         public int ChainIndex;
         public string Id;
         public double OriginX, OriginY, OriginZ;
+        public string HandleTxtOrigin;
         public List<DtoSegment> Segments = new List<DtoSegment>();
         public List<DtoSegment> Radiations = new List<DtoSegment>();
     }
@@ -127,6 +128,7 @@ namespace CadastreTools
         public int ChainIndex { get; set; }
         public string Id => $"TRAV {ChainIndex}";
         public Point3d OriginPoint { get; set; }
+        public ObjectId TextOriginId { get; set; }
         public List<TraverseSegment> Segments { get; set; } = new List<TraverseSegment>();
         public List<TraverseSegment> Radiations { get; set; } = new List<TraverseSegment>();
         public bool IsVisible { get; set; } = true;
@@ -169,6 +171,7 @@ namespace CadastreTools
                 foreach (var t in traverses)
                 {
                     DtoChain dt = new DtoChain() { ChainIndex = t.ChainIndex, Id = t.Id, OriginX = t.OriginPoint.X, OriginY = t.OriginPoint.Y, OriginZ = t.OriginPoint.Z };
+                    dt.HandleTxtOrigin = t.TextOriginId.IsValid ? t.TextOriginId.Handle.ToString() : "";
                     foreach (var s in t.Segments) dt.Segments.Add(ConvertSeg(s));
                     foreach (var r in t.Radiations) dt.Radiations.Add(ConvertSeg(r));
                     data.Chains.Add(dt);
@@ -230,6 +233,7 @@ namespace CadastreTools
                 foreach (var dc in data.Chains)
                 {
                     TraverseChain tc = new TraverseChain() { ChainIndex = dc.ChainIndex, OriginPoint = new Point3d(dc.OriginX, dc.OriginY, dc.OriginZ) };
+                    tc.TextOriginId = Resolve(dc.HandleTxtOrigin, db);
                     foreach (var ds in dc.Segments) tc.Segments.Add(RebuildSeg(ds, db));
                     foreach (var dr in dc.Radiations) tc.Radiations.Add(RebuildSeg(dr, db));
                     list.Add(tc);
@@ -262,6 +266,7 @@ namespace CadastreTools
                     foreach (var dc in data.Chains)
                     {
                         TraverseChain tc = new TraverseChain() { ChainIndex = dc.ChainIndex, OriginPoint = new Point3d(dc.OriginX, dc.OriginY, dc.OriginZ) };
+                        tc.TextOriginId = Resolve(dc.HandleTxtOrigin, db);
                         foreach (var ds in dc.Segments) tc.Segments.Add(RebuildSeg(ds, db));
                         foreach (var dr in dc.Radiations) tc.Radiations.Add(RebuildSeg(dr, db));
                         list.Add(tc);
@@ -303,13 +308,14 @@ namespace CadastreTools
             };
         }
 
+        private static ObjectId Resolve(string h, Database db)
+        {
+            if (string.IsNullOrEmpty(h)) return ObjectId.Null;
+            try { return db.GetObjectId(false, new Handle(Convert.ToInt64(h, 16)), 0); } catch { return ObjectId.Null; }
+        }
+
         private static TraverseSegment RebuildSeg(DtoSegment d, Database db)
         {
-            ObjectId Resolve(string h)
-            {
-                if (string.IsNullOrEmpty(h)) return ObjectId.Null;
-                try { return db.GetObjectId(false, new Handle(Convert.ToInt64(h, 16)), 0); } catch { return ObjectId.Null; }
-            }
             return new TraverseSegment()
             {
                 TraverseId = d.TraverseId,
@@ -323,11 +329,11 @@ namespace CadastreTools
                 IsRadiation = d.IsRadiation,
                 StartPoint = new Point3d(d.StartX, d.StartY, d.StartZ),
                 EndPoint = new Point3d(d.EndX, d.EndY, d.EndZ),
-                LineId = Resolve(d.HandleLine),
-                TextBrgId = Resolve(d.HandleTxtBrg),
-                TextDistId = Resolve(d.HandleTxtDist),
-                TextPtId = Resolve(d.HandleTxtPt),
-                TextCommId = Resolve(d.HandleTxtComm)
+                LineId = Resolve(d.HandleLine, db),
+                TextBrgId = Resolve(d.HandleTxtBrg, db),
+                TextDistId = Resolve(d.HandleTxtDist, db),
+                TextPtId = Resolve(d.HandleTxtPt, db),
+                TextCommId = Resolve(d.HandleTxtComm, db)
             };
         }
     }
@@ -957,6 +963,14 @@ namespace CadastreTools
 
                 foreach (var chain in _allTraverses)
                 {
+                    // 0. Origin Point Text
+                    if (chain.TextOriginId.IsNull || chain.TextOriginId.IsErased)
+                    {
+                        int startNum = chain.ChainIndex * 1000 + 1;
+                        Entity ptTxt = CreateText(startNum.ToString(), CadConstants.LAY_TXT_PTNUM, chain.OriginPoint, AttachmentPoint.BottomLeft, tr, doc.Database, _config.TextPt);
+                        chain.TextOriginId = AddToDb(ptTxt, btr, tr);
+                    }
+
                     // Process Segments
                     foreach (var seg in chain.Segments)
                     {
@@ -1192,7 +1206,7 @@ namespace CadastreTools
             {
                 BlockTableRecord btr = (BlockTableRecord)tr.GetObject(((BlockTable)tr.GetObject(doc.Database.BlockTableId, OpenMode.ForRead))[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
                 Entity ptTxt = CreateText(firstPt.ToString(), CadConstants.LAY_TXT_PTNUM, start, AttachmentPoint.BottomLeft, tr, doc.Database, _config.TextPt);
-                AddToDb(ptTxt, btr, tr);
+                _currentTraverse.TextOriginId = AddToDb(ptTxt, btr, tr);
                 tr.Commit();
             }
             UpdateRunningMisclosure(); CalculateArea(); UpdateGuideText("ENTER AZIMUTH/DIST"); lblStatus.Content = $"Traverse {traverseNum} Started.";
