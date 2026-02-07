@@ -1704,6 +1704,14 @@ namespace CadastreTools
                 if (e.Key == Key.Escape) { HideOverlay(); e.Handled = true; }
                 return;
             }
+
+            if (e.Key == Key.Z && (Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control)
+            {
+                e.Handled = true;
+                UndoLastStep();
+                return;
+            }
+
             if (e.Key == Key.PageUp) { e.Handled = true; StartNewTraverse(true); }
             if (e.Key == Key.PageDown) { e.Handled = true; ShowRadiationOverlay(); }
             if (e.Key == Key.Insert) { e.Handled = true; ShowCommentOverlay(); }
