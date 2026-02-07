@@ -135,6 +135,9 @@ namespace CadastreTools
     // --- 4. PERSISTENCE ENGINE (UPDATED TO USE XML FILE) ---
     public static class PersistenceManager
     {
+        // Session Cache for unsaved drawings or tab switching
+        private static Dictionary<string, DtoSaveData> _sessionCache = new Dictionary<string, DtoSaveData>();
+
         public static string? GetDwgPath(Document doc)
         {
             if (doc == null) return null;
@@ -161,14 +164,7 @@ namespace CadastreTools
 
             try
             {
-                string? dwgPath = GetDwgPath(doc);
-                if (dwgPath == null)
-                {
-                    return;
-                }
-
-                string xmlFile = dwgPath + ".database.xml";
-
+                // Prepare Data
                 DtoSaveData data = new DtoSaveData();
                 foreach (var t in traverses)
                 {
@@ -177,6 +173,22 @@ namespace CadastreTools
                     foreach (var r in t.Radiations) dt.Radiations.Add(ConvertSeg(r));
                     data.Chains.Add(dt);
                 }
+
+                // 1. Save to Session Cache (Memory)
+                if (doc.Database != null)
+                {
+                    _sessionCache[doc.Database.FingerprintGuid] = data;
+                }
+
+                // 2. Save to XML File (Disk)
+                string? dwgPath = GetDwgPath(doc);
+                if (dwgPath == null)
+                {
+                    doc.Editor.WriteMessage("\n[Cadastre] Drawing unsaved. Data cached in session memory.");
+                    return;
+                }
+
+                string xmlFile = dwgPath + ".database.xml";
 
                 XmlSerializer xs = new XmlSerializer(typeof(DtoSaveData));
                 using (var fs = new FileStream(xmlFile, FileMode.Create, FileAccess.Write, FileShare.ReadWrite))
@@ -201,32 +213,47 @@ namespace CadastreTools
 
             try
             {
+                DtoSaveData? data = null;
                 string? dwgPath = GetDwgPath(doc);
-                if (dwgPath == null)
+
+                // 1. Try Load from XML File
+                if (dwgPath != null)
                 {
-                    doc.Editor.WriteMessage("\n[Cadastre] New/Unsaved drawing detected. Starting fresh.");
+                    string xmlFile = dwgPath + ".database.xml";
+                    if (File.Exists(xmlFile))
+                    {
+                        doc.Editor.WriteMessage("\n[Cadastre] Loading database from: " + xmlFile);
+                        XmlSerializer xs = new XmlSerializer(typeof(DtoSaveData));
+                        using (var fs = new FileStream(xmlFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                        using (StreamReader rd = new StreamReader(fs))
+                        {
+                            data = (DtoSaveData)xs.Deserialize(rd);
+                        }
+
+                        // Update Cache with fresh data from disk
+                        if (data != null)
+                        {
+                            _sessionCache[doc.Database.FingerprintGuid] = data;
+                        }
+                    }
+                }
+
+                // 2. Fallback to Session Cache
+                if (data == null)
+                {
+                     if (_sessionCache.ContainsKey(doc.Database.FingerprintGuid))
+                     {
+                         doc.Editor.WriteMessage("\n[Cadastre] Loading from session cache.");
+                         data = _sessionCache[doc.Database.FingerprintGuid];
+                     }
+                }
+
+                // 3. Rebuild Objects
+                if (data == null || data.Chains == null) 
+                {
+                    if (dwgPath != null) doc.Editor.WriteMessage("\n[Cadastre] No database found.");
                     return list;
                 }
-
-                string xmlFile = dwgPath + ".database.xml";
-
-                doc.Editor.WriteMessage("\n[Cadastre] Looking for DB at: " + xmlFile);
-
-                if (!File.Exists(xmlFile)) 
-                {
-                    doc.Editor.WriteMessage("\n[Cadastre] No database file found.");
-                    return list;
-                }
-
-                DtoSaveData data;
-                XmlSerializer xs = new XmlSerializer(typeof(DtoSaveData));
-                using (var fs = new FileStream(xmlFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                using (StreamReader rd = new StreamReader(fs))
-                {
-                    data = (DtoSaveData)xs.Deserialize(rd);
-                }
-
-                if (data == null || data.Chains == null) return list;
 
                 Database db = doc.Database;
                 foreach (var dc in data.Chains)
