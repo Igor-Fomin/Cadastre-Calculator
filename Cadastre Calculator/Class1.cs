@@ -811,7 +811,7 @@ namespace CadastreTools
             GridView grid = new GridView();
             grid.Columns.Add(new GridViewColumn() { Header = "LINE / PT", Width = 110, DisplayMemberBinding = new System.Windows.Data.Binding("DisplayLine") });
             grid.Columns.Add(new GridViewColumn() { Header = "AZIMUTH", Width = 90, DisplayMemberBinding = new System.Windows.Data.Binding("DisplayAzimuth") });
-            grid.Columns.Add(new GridViewColumn() { Header = "DIST", Width = 70, DisplayMemberBinding = new System.Windows.Data.Binding("DisplayDist") });
+            grid.Columns.Add(new GridViewColumn() { Header = "DISTANCE", Width = 70, DisplayMemberBinding = new System.Windows.Data.Binding("DisplayDist") });
             grid.Columns.Add(new GridViewColumn() { Header = "COMMENT", Width = 100, DisplayMemberBinding = new System.Windows.Data.Binding("Comment") });
             lstHistory.View = grid;
             lstHistory.MouseDoubleClick += LstHistory_MouseDoubleClick;
@@ -1406,6 +1406,14 @@ namespace CadastreTools
                     {
                         Vector3d delta = seg.StartPoint - seg.EndPoint;
                         PropagateShift(seg, Matrix3d.Displacement(delta), tr);
+
+                        // Update radiations attached to this point to follow the stitch back to start point
+                        foreach (var rad in chain.Radiations)
+                        {
+                            if (rad.ParentStationId == seg.PointNumber)
+                                rad.ParentStationId = seg.FromPoint;
+                        }
+
                         chain.Segments.Remove(seg);
                         RenumberTraversePoints(chain, tr);
                     }
@@ -1424,20 +1432,29 @@ namespace CadastreTools
             {
                 int idx = chain.Segments.IndexOf(seg);
                 if (idx == -1) return;
+
+                // Track all points that are moving
+                HashSet<int> movingStations = new HashSet<int>();
+                movingStations.Add(seg.PointNumber);
+
                 for (int i = idx + 1; i < chain.Segments.Count; i++)
                 {
                     var sub = chain.Segments[i];
-                    sub.StartPoint = sub.StartPoint.TransformBy(matMove); sub.EndPoint = sub.EndPoint.TransformBy(matMove);
-                    TransformEntity(sub.LineId, matMove, tr); TransformEntity(sub.TextBrgId, matMove, tr); TransformEntity(sub.TextDistId, matMove, tr); TransformEntity(sub.TextPtId, matMove, tr); TransformEntity(sub.TextCommId, matMove, tr);
+                    movingStations.Add(sub.PointNumber);
 
-                    foreach (var rad in chain.Radiations)
+                    sub.StartPoint = sub.StartPoint.TransformBy(matMove);
+                    sub.EndPoint = sub.EndPoint.TransformBy(matMove);
+                    TransformEntity(sub.LineId, matMove, tr); TransformEntity(sub.TextBrgId, matMove, tr); TransformEntity(sub.TextDistId, matMove, tr); TransformEntity(sub.TextPtId, matMove, tr); TransformEntity(sub.TextCommId, matMove, tr);
+                }
+
+                // Update ALL radiations attached to any moving station
+                foreach (var rad in chain.Radiations)
+                {
+                    if (movingStations.Contains(rad.ParentStationId))
                     {
-                        if (rad.ParentStationId == sub.FromPoint)
-                        {
-                            rad.StartPoint = rad.StartPoint.TransformBy(matMove);
-                            rad.EndPoint = rad.EndPoint.TransformBy(matMove);
-                            TransformEntity(rad.LineId, matMove, tr); TransformEntity(rad.TextBrgId, matMove, tr); TransformEntity(rad.TextDistId, matMove, tr); TransformEntity(rad.TextPtId, matMove, tr); TransformEntity(rad.TextCommId, matMove, tr);
-                        }
+                        rad.StartPoint = rad.StartPoint.TransformBy(matMove);
+                        rad.EndPoint = rad.EndPoint.TransformBy(matMove);
+                        TransformEntity(rad.LineId, matMove, tr); TransformEntity(rad.TextBrgId, matMove, tr); TransformEntity(rad.TextDistId, matMove, tr); TransformEntity(rad.TextPtId, matMove, tr); TransformEntity(rad.TextCommId, matMove, tr);
                     }
                 }
             }
@@ -1446,18 +1463,35 @@ namespace CadastreTools
         private void RenumberTraversePoints(TraverseChain chain, Transaction tr)
         {
             int baseNum = chain.ChainIndex * 1000;
+            Dictionary<int, int> pointMap = new Dictionary<int, int>();
+
             for (int i = 0; i < chain.Segments.Count; i++)
             {
                 var seg = chain.Segments[i];
+                int oldPt = seg.PointNumber;
+
                 seg.FromPoint = baseNum + i + 1;
                 seg.ToPoint = baseNum + i + 2;
                 seg.PointNumber = seg.ToPoint;
+
+                if (oldPt != 0) pointMap[oldPt] = seg.PointNumber;
+
                 seg.NotifyUpdate();
 
                 if (!seg.TextPtId.IsErased)
                 {
                     Entity ent = (Entity)tr.GetObject(seg.TextPtId, OpenMode.ForWrite);
                     if (ent is DBText dt) dt.TextString = seg.PointNumber.ToString(); else if (ent is MText mt) mt.Contents = seg.PointNumber.ToString();
+                }
+            }
+
+            // Update radiations to maintain attachment to their stations
+            foreach (var rad in chain.Radiations)
+            {
+                if (pointMap.ContainsKey(rad.ParentStationId))
+                {
+                    rad.ParentStationId = pointMap[rad.ParentStationId];
+                    rad.NotifyUpdate();
                 }
             }
         }

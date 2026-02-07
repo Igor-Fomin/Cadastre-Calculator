@@ -6,21 +6,25 @@
              xmlns:local="clr-namespace:Cadastre_Calculator"
              mc:Ignorable="d" 
              d:DesignHeight="450" d:DesignWidth="300">
-    <Grid Background="{DynamicResource WindowBackgroundBrush}">
-        <StackPanel Margin="10">
-            <TextBlock Text="Parcel ID" Foreground="{DynamicResource TextBrush}" Margin="0,0,0,5"/>
-            <TextBox Text="{Binding ParcelID, UpdateSourceTrigger=PropertyChanged}" 
+	<Grid Background="{DynamicResource WindowBackgroundBrush}">
+		<Grid.ColumnDefinitions>
+			<ColumnDefinition Width="14*"/>
+			<ColumnDefinition/>
+		</Grid.ColumnDefinitions>
+		<StackPanel Margin="10,10,10,10" Grid.ColumnSpan="2">
+			<TextBlock Text="Parcel ID" Foreground="{DynamicResource TextBrush}" Margin="0,0,0,5"/>
+			<TextBox Text="{Binding ParcelID, UpdateSourceTrigger=PropertyChanged}" 
                      Background="{DynamicResource ControlBackgroundBrush}" 
                      Foreground="{DynamicResource TextBrush}" 
                      BorderBrush="{DynamicResource BorderBrush}"
                      Margin="0,0,0,15"/>
 
-            <TextBlock Text="Owner Name" Foreground="{DynamicResource TextBrush}" Margin="0,0,0,5"/>
-            <TextBox Text="{Binding OwnerName, UpdateSourceTrigger=PropertyChanged}" 
+			<TextBlock Text="Owner Name" Foreground="{DynamicResource TextBrush}" Margin="0,0,0,5"/>
+			<TextBox Text="{Binding OwnerName, UpdateSourceTrigger=PropertyChanged}" 
                      Background="{DynamicResource ControlBackgroundBrush}" 
                      Foreground="{DynamicResource TextBrush}" 
                      BorderBrush="{DynamicResource BorderBrush}"
                      Margin="0,0,0,15"/>
-        </StackPanel>
-    </Grid>
+		</StackPanel>
+	</Grid>
 </UserControl>
