@@ -242,8 +242,16 @@ namespace CadastreTools
                 {
                     TraverseChain tc = new TraverseChain() { ChainIndex = dc.ChainIndex, OriginPoint = new Point3d(dc.OriginX, dc.OriginY, dc.OriginZ) };
                     tc.TextOriginId = Resolve(dc.HandleTxtOrigin, db);
-                    foreach (var ds in dc.Segments) tc.Segments.Add(RebuildSeg(ds, db));
-                    foreach (var dr in dc.Radiations) tc.Radiations.Add(RebuildSeg(dr, db));
+                    foreach (var ds in dc.Segments)
+                    {
+                        var seg = RebuildSeg(ds, db);
+                        if (!seg.IsBroken) tc.Segments.Add(seg);
+                    }
+                    foreach (var dr in dc.Radiations)
+                    {
+                        var rad = RebuildSeg(dr, db);
+                        if (!rad.IsBroken) tc.Radiations.Add(rad);
+                    }
                     list.Add(tc);
                 }
                 return list;
@@ -275,8 +283,16 @@ namespace CadastreTools
                     {
                         TraverseChain tc = new TraverseChain() { ChainIndex = dc.ChainIndex, OriginPoint = new Point3d(dc.OriginX, dc.OriginY, dc.OriginZ) };
                         tc.TextOriginId = Resolve(dc.HandleTxtOrigin, db);
-                        foreach (var ds in dc.Segments) tc.Segments.Add(RebuildSeg(ds, db));
-                        foreach (var dr in dc.Radiations) tc.Radiations.Add(RebuildSeg(dr, db));
+                        foreach (var ds in dc.Segments)
+                        {
+                            var seg = RebuildSeg(ds, db);
+                            if (!seg.IsBroken) tc.Segments.Add(seg);
+                        }
+                        foreach (var dr in dc.Radiations)
+                        {
+                            var rad = RebuildSeg(dr, db);
+                            if (!rad.IsBroken) tc.Radiations.Add(rad);
+                        }
                         list.Add(tc);
                     }
                 }
@@ -707,6 +723,7 @@ namespace CadastreTools
         private Wpf.CheckBox setChkAudio;
         private List<TextUiRow> _textUiRows = new List<TextUiRow>();
         private Database? _hookedDb = null;
+        private Document? _hookedDoc = null;
         private class TextUiRow { public Wpf.ComboBox CmbStyle; public Wpf.TextBox TxtSize; public Wpf.Button BtnColor; public Wpf.CheckBox ChkMText; public Wpf.CheckBox ChkMask; public Wpf.CheckBox ChkVisible; public TextSettings SettingsRef; public string AssociatedLayer; }
 
         public CadastreControl()
@@ -745,8 +762,17 @@ namespace CadastreTools
         private void ResetForNewDocument()
         {
             var doc = AcApp.DocumentManager.MdiActiveDocument;
+
+            if (_hookedDoc != null)
+            {
+                try { _hookedDoc.CommandEnded -= Document_CommandEnded; } catch { }
+            }
+
             if (doc != null)
             {
+                _hookedDoc = doc;
+                _hookedDoc.CommandEnded += Document_CommandEnded;
+
                 if (_hookedDb != null)
                 {
                     try { _hookedDb.SaveComplete -= Database_SaveComplete; } catch { }
@@ -763,7 +789,51 @@ namespace CadastreTools
             _lastPtNum = 0; // RESET
             if (lblStatus != null) lblStatus.Content = "Document Switched. Loading...";
             ReloadDataFromDwg();
-            UpdateGuideText("PICK START POINT");
+            UpdateActiveGuide();
+        }
+
+        private void Document_CommandEnded(object sender, CommandEventArgs e)
+        {
+            if (e.GlobalCommandName == "U" || e.GlobalCommandName == "UNDO" || e.GlobalCommandName == "REDO")
+            {
+                SyncDatabaseToDrawing();
+            }
+        }
+
+        private void SyncDatabaseToDrawing()
+        {
+            bool changed = false;
+            foreach (var t in _allTraverses.ToList())
+            {
+                for (int i = t.Segments.Count - 1; i >= 0; i--)
+                {
+                    var s = t.Segments[i];
+                    if (s.LineId.IsNull || s.LineId.IsErased)
+                    {
+                        t.Segments.RemoveAt(i);
+                        _logItems.Remove(s);
+                        changed = true;
+                    }
+                }
+                for (int i = t.Radiations.Count - 1; i >= 0; i--)
+                {
+                    var r = t.Radiations[i];
+                    if (r.LineId.IsNull || r.LineId.IsErased)
+                    {
+                        t.Radiations.RemoveAt(i);
+                        _logItems.Remove(r);
+                        changed = true;
+                    }
+                }
+            }
+
+            if (changed)
+            {
+                SyncCurrentState();
+                SaveState();
+                RefreshTraverseList();
+                if (lblStatus != null) lblStatus.Content = "Database synced after Undo/Redo.";
+            }
         }
 
         private void Database_SaveComplete(object sender, EventArgs e)
@@ -2039,6 +2109,37 @@ namespace CadastreTools
             if (lstHistory.SelectedItem is TraverseSegment seg) 
             { 
                 PanToPoint(seg.EndPoint);
+
+                // INTEGRITY CHECK: Validate plugin data against actual DWG geometry
+                var doc = AcApp.DocumentManager.MdiActiveDocument;
+                if (doc != null && seg.LineId.IsValid && !seg.LineId.IsErased)
+                {
+                    using (var tr = doc.TransactionManager.StartOpenCloseTransaction())
+                    {
+                        var ln = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(seg.LineId, OpenMode.ForRead);
+                        Vector3d v = ln.EndPoint - ln.StartPoint;
+                        double actualDist = v.Length;
+                        
+                        // Calculate Azimuth from geometry
+                        double rad = Math.Atan2(v.Y, v.X);
+                        double deg = (90.0 - (rad * 180.0 / Math.PI));
+                        while (deg < 0) deg += 360; deg %= 360;
+                        double actualAz = double.Parse(CadMath.DegreesToDmsString(deg));
+
+                        // Compare with stored values (Tolerance: 1mm for dist, 1 sec for brg)
+                        if (Math.Abs(actualDist - seg.Distance) > 0.001 || 
+                            Math.Abs(CadMath.ParseDmsToDegrees(actualAz) - CadMath.ParseDmsToDegrees(seg.RawAzimuth)) > 0.0001)
+                        {
+                            seg.Distance = actualDist;
+                            seg.RawAzimuth = actualAz;
+                            seg.StartPoint = ln.StartPoint;
+                            seg.EndPoint = ln.EndPoint;
+                            seg.NotifyUpdate();
+                            if (lblStatus != null) lblStatus.Content = "⚠️ Record updated from Drawing geometry.";
+                        }
+                    }
+                }
+
                 var chain = _allTraverses.FirstOrDefault(t => t.Id == seg.TraverseId);
                 if (chain != null)
                 {
