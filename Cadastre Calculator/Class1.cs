@@ -311,7 +311,13 @@ namespace CadastreTools
         private static ObjectId Resolve(string h, Database db)
         {
             if (string.IsNullOrEmpty(h)) return ObjectId.Null;
-            try { return db.GetObjectId(false, new Handle(Convert.ToInt64(h, 16)), 0); } catch { return ObjectId.Null; }
+            try 
+            { 
+                ObjectId id = db.GetObjectId(false, new Handle(Convert.ToInt64(h, 16)), 0);
+                if (id.IsErased) return ObjectId.Null;
+                return id;
+            } 
+            catch { return ObjectId.Null; }
         }
 
         private static TraverseSegment RebuildSeg(DtoSegment d, Database db)
@@ -744,7 +750,11 @@ namespace CadastreTools
         {
             if (_allTraverses.Count > 0)
             {
-                _currentTraverse = _allTraverses.Last();
+                if (_currentTraverse == null || !_allTraverses.Contains(_currentTraverse))
+                {
+                    _currentTraverse = _allTraverses.Last();
+                }
+
                 if (_currentTraverse.Segments.Count > 0)
                 {
                     var lastSeg = _currentTraverse.Segments.Last();
@@ -1721,6 +1731,11 @@ namespace CadastreTools
             {
                 Entity ent = (Entity)tr.GetObject(id, OpenMode.ForRead);
                 if (ent is DBPoint pt && pt.Position.DistanceTo(target) < _config.SnapTolerance) return pt.Position;
+                if (ent is Autodesk.AutoCAD.DatabaseServices.Line ln)
+                {
+                    if (ln.StartPoint.DistanceTo(target) < _config.SnapTolerance) return ln.StartPoint;
+                    if (ln.EndPoint.DistanceTo(target) < _config.SnapTolerance) return ln.EndPoint;
+                }
             }
             return target;
         }
@@ -1890,7 +1905,25 @@ namespace CadastreTools
             AppSettings.Save(_config);
         }
 
-        private void LstHistory_SelectionChanged(object sender, SelectionChangedEventArgs e) { if (lstHistory.SelectedItem is TraverseSegment seg) PanToPoint(seg.EndPoint); }
+        private void LstHistory_SelectionChanged(object sender, SelectionChangedEventArgs e) 
+        { 
+            if (lstHistory.SelectedItem is TraverseSegment seg) 
+            { 
+                PanToPoint(seg.EndPoint);
+                var chain = _allTraverses.FirstOrDefault(t => t.Id == seg.TraverseId);
+                if (chain != null)
+                {
+                    _currentTraverse = chain;
+                    _currentPoint = seg.EndPoint;
+                    _lastPtNum = seg.PointNumber;
+                    _traversePath.Clear();
+                    _traversePath.Add(_currentTraverse.OriginPoint);
+                    foreach (var s in _currentTraverse.Segments) _traversePath.Add(s.EndPoint);
+                    UpdateRunningMisclosure();
+                    CalculateArea();
+                }
+            } 
+        }
         private void Control_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
         {
             if (_overlayContainer.Visibility == System.Windows.Visibility.Visible)
