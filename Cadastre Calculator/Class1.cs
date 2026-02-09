@@ -59,6 +59,7 @@ namespace CadastreTools
         public double Distance;
         public string Comment;
         public bool IsRadiation;
+        public bool IsBroken;
         public string HandleLine; // Store Hex Handle instead of ObjectId
         public string HandleTxtBrg;
         public string HandleTxtDist;
@@ -302,6 +303,7 @@ namespace CadastreTools
                 Distance = s.Distance,
                 Comment = s.Comment,
                 IsRadiation = s.IsRadiation,
+                IsBroken = s.IsBroken,
                 StartX = s.StartPoint.X,
                 StartY = s.StartPoint.Y,
                 StartZ = s.StartPoint.Z,
@@ -316,13 +318,27 @@ namespace CadastreTools
             };
         }
 
-        private static ObjectId Resolve(string h, Database db)
+        private static ObjectId Resolve(string h, Database db, Point3d? expectedPos = null, double tolerance = 0.05)
         {
             if (string.IsNullOrEmpty(h)) return ObjectId.Null;
             try 
             { 
                 ObjectId id = db.GetObjectId(false, new Handle(Convert.ToInt64(h, 16)), 0);
                 if (id.IsErased) return ObjectId.Null;
+
+                if (expectedPos.HasValue)
+                {
+                    using (var tr = db.TransactionManager.StartOpenCloseTransaction())
+                    {
+                        Entity ent = (Entity)tr.GetObject(id, OpenMode.ForRead);
+                        Point3d actualPos = Point3d.Origin;
+                        if (ent is Autodesk.AutoCAD.DatabaseServices.Line ln) actualPos = ln.StartPoint;
+                        else if (ent is DBText dt) actualPos = dt.Position;
+                        else if (ent is MText mt) actualPos = mt.Location;
+
+                        if (actualPos.DistanceTo(expectedPos.Value) > tolerance) return ObjectId.Null;
+                    }
+                }
                 return id;
             } 
             catch { return ObjectId.Null; }
@@ -335,25 +351,23 @@ namespace CadastreTools
             double az = d.RawAzimuth;
             double dist = d.Distance;
             
-            ObjectId lineId = Resolve(d.HandleLine, db);
+            // Resolve with 0.05m tolerance for healing
+            ObjectId lineId = Resolve(d.HandleLine, db, start, 0.05);
 
-            // GEOMETRIC HEALING: Update data from DWG if handle is valid but geometry moved
+            // GEOMETRIC HEALING: Update data from DWG if handle is valid but geometry shifted slightly
             if (lineId.IsValid && !lineId.IsErased)
             {
                 using (var tr = db.TransactionManager.StartOpenCloseTransaction())
                 {
                     var ln = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(lineId, OpenMode.ForRead);
-                    if (ln.StartPoint.DistanceTo(start) > 0.001 || ln.EndPoint.DistanceTo(end) > 0.001)
-                    {
-                        start = ln.StartPoint;
-                        end = ln.EndPoint;
-                        Vector3d v = end - start;
-                        dist = v.Length;
-                        double rad = Math.Atan2(v.Y, v.X);
-                        double deg = (90.0 - (rad * 180.0 / Math.PI));
-                        while (deg < 0) deg += 360; deg %= 360;
-                        az = double.Parse(CadMath.DegreesToDmsString(deg));
-                    }
+                    start = ln.StartPoint;
+                    end = ln.EndPoint;
+                    Vector3d v = end - start;
+                    dist = v.Length;
+                    double rad = Math.Atan2(v.Y, v.X);
+                    double deg = (90.0 - (rad * 180.0 / Math.PI));
+                    while (deg < 0) deg += 360; deg %= 360;
+                    az = double.Parse(CadMath.DegreesToDmsString(deg));
                 }
             }
 
@@ -373,9 +387,9 @@ namespace CadastreTools
                 LineId = lineId,
                 TextBrgId = Resolve(d.HandleTxtBrg, db),
                 TextDistId = Resolve(d.HandleTxtDist, db),
-                TextPtId = Resolve(d.HandleTxtPt, db),
-                TextCommId = Resolve(d.HandleTxtComm, db),
-                IsBroken = lineId.IsNull
+                TextPtId = Resolve(d.HandleTxtPt, db, end, 0.05),
+                TextCommId = Resolve(d.HandleTxtComm, db, end, 0.05),
+                IsBroken = d.IsBroken || lineId.IsNull
             };
         }
 
@@ -1204,10 +1218,45 @@ namespace CadastreTools
                 BlockTableRecord btr = (BlockTableRecord)tr.GetObject(((BlockTable)tr.GetObject(doc.Database.BlockTableId, OpenMode.ForRead))[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
                 EnsureLayerExists(_currentLayer, tr, doc.Database);
 
+                // STEP 1: TOTAL CLEANUP (Erase all known annotations for visible traverses)
                 foreach (var chain in _allTraverses)
                 {
+                    if (!chain.IsVisible) continue;
+
+                    ObjectId SafeErase(ObjectId id) 
+                    { 
+                        if (id.IsValid && !id.IsErased) 
+                        { 
+                            ((Entity)tr.GetObject(id, OpenMode.ForWrite)).Erase(); 
+                        } 
+                        return ObjectId.Null; 
+                    }
+                    
+                    chain.TextOriginId = SafeErase(chain.TextOriginId);
+
+                    foreach (var seg in chain.Segments)
+                    {
+                        seg.TextBrgId = SafeErase(seg.TextBrgId);
+                        seg.TextDistId = SafeErase(seg.TextDistId);
+                        seg.TextPtId = SafeErase(seg.TextPtId);
+                        seg.TextCommId = SafeErase(seg.TextCommId);
+                    }
+                    foreach (var rad in chain.Radiations)
+                    {
+                        rad.TextBrgId = SafeErase(rad.TextBrgId);
+                        rad.TextDistId = SafeErase(rad.TextDistId);
+                        rad.TextPtId = SafeErase(rad.TextPtId);
+                        rad.TextCommId = SafeErase(rad.TextCommId);
+                    }
+                }
+
+                // STEP 2: REBUILD GEOMETRY
+                foreach (var chain in _allTraverses)
+                {
+                    if (!chain.IsVisible) continue;
+
                     // 0. Origin Point Text
-                    if (chain.TextOriginId.IsNull || chain.TextOriginId.IsErased)
+                    if (chain.TextOriginId.IsNull)
                     {
                         int startNum = chain.ChainIndex * 1000 + 1;
                         Entity ptTxt = CreateText(startNum.ToString(), CadConstants.LAY_TXT_PTNUM, chain.OriginPoint, AttachmentPoint.BottomLeft, tr, doc.Database, _config.TextPt);
@@ -1226,55 +1275,25 @@ namespace CadastreTools
                             seg.IsBroken = false; // HEALED
                         }
 
-                        // 2. Annotations (Brg/Dist)
-                        if (seg.TextBrgId.IsNull || seg.TextBrgId.IsErased || seg.TextDistId.IsNull || seg.TextDistId.IsErased)
-                        {
-                            Autodesk.AutoCAD.DatabaseServices.Line lnObj;
-                            if (seg.LineId.IsValid && !seg.LineId.IsErased)
-                            {
-                                lnObj = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(seg.LineId, OpenMode.ForRead);
-                            }
-                            else
-                            {
-                                lnObj = new Autodesk.AutoCAD.DatabaseServices.Line(seg.StartPoint, seg.EndPoint);
-                            }
+                        // 2. Annotations (Always recreate because we erased them)
+                        Autodesk.AutoCAD.DatabaseServices.Line lnObj;
+                        if (seg.LineId.IsValid && !seg.LineId.IsErased)
+                            lnObj = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(seg.LineId, OpenMode.ForRead);
+                        else
+                            lnObj = new Autodesk.AutoCAD.DatabaseServices.Line(seg.StartPoint, seg.EndPoint);
 
-                            double rad = (90.0 - CadMath.ParseDmsToDegrees(seg.RawAzimuth)) * (Math.PI / 180.0);
-                            double textRot = rad; double norm = rad % (Math.PI * 2); if (norm < 0) norm += Math.PI * 2;
-                            if (norm > Math.PI / 2 && norm <= 3 * Math.PI / 2) textRot += Math.PI;
-                            Point3d mid = lnObj.StartPoint + (lnObj.EndPoint - lnObj.StartPoint) / 2.0;
-                            Vector3d up = new Vector3d(-Math.Sin(rad), Math.Cos(rad), 0); if (norm > Math.PI / 2 && norm <= 3 * Math.PI / 2) up = -up;
-                            Point3d ptBrg = mid + up * _config.TextBrg.Size * 0.7;
-                            Point3d ptDist = mid - up * _config.TextDist.Size * 0.7;
-
-                            // Cleanup GHOSTS (Existing text at same location but unlinked)
-                            if (seg.TextBrgId.IsValid) EraseId(seg.TextBrgId, tr); 
-                            else { ObjectId ghost = DwgDataManager.FindTextAtLocation(ptBrg, CadConstants.LAY_TXT_BRG, tr, doc.Database); EraseId(ghost, tr); }
-
-                            if (seg.TextDistId.IsValid) EraseId(seg.TextDistId, tr);
-                            else { ObjectId ghost = DwgDataManager.FindTextAtLocation(ptDist, CadConstants.LAY_TXT_DIST, tr, doc.Database); EraseId(ghost, tr); }
-
-                            var ids = CreateAnnotatedText(btr, tr, lnObj, seg.RawAzimuth, seg.Distance, rad);
-                            seg.TextBrgId = ids[0];
-                            seg.TextDistId = ids[1];
-                        }
+                        double rad = (90.0 - CadMath.ParseDmsToDegrees(seg.RawAzimuth)) * (Math.PI / 180.0);
+                        var ids = CreateAnnotatedText(btr, tr, lnObj, seg.RawAzimuth, seg.Distance, rad);
+                        seg.TextBrgId = ids[0];
+                        seg.TextDistId = ids[1];
 
                         // 3. Point Number
-                        if (seg.TextPtId.IsNull || seg.TextPtId.IsErased)
-                        {
-                            if (seg.TextPtId.IsValid) EraseId(seg.TextPtId, tr);
-                            else { ObjectId ghost = DwgDataManager.FindTextAtLocation(seg.EndPoint, CadConstants.LAY_TXT_PTNUM, tr, doc.Database); EraseId(ghost, tr); }
-
-                            Entity ptTxt = CreateText(seg.PointNumber.ToString(), CadConstants.LAY_TXT_PTNUM, seg.EndPoint, AttachmentPoint.BottomLeft, tr, doc.Database, _config.TextPt);
-                            seg.TextPtId = AddToDb(ptTxt, btr, tr);
-                        }
+                        Entity ptTxt = CreateText(seg.PointNumber.ToString(), CadConstants.LAY_TXT_PTNUM, seg.EndPoint, AttachmentPoint.BottomLeft, tr, doc.Database, _config.TextPt);
+                        seg.TextPtId = AddToDb(ptTxt, btr, tr);
 
                         // 4. Comment
-                        if ((seg.TextCommId.IsNull || seg.TextCommId.IsErased) && !string.IsNullOrEmpty(seg.Comment))
+                        if (!string.IsNullOrEmpty(seg.Comment))
                         {
-                             if (seg.TextCommId.IsValid) EraseId(seg.TextCommId, tr);
-                             else { ObjectId ghost = DwgDataManager.FindTextAtLocation(seg.EndPoint, CadConstants.LAY_TXT_SYMB, tr, doc.Database); EraseId(ghost, tr); }
-
                              Entity txt = CreateText(seg.Comment, CadConstants.LAY_TXT_SYMB, seg.EndPoint, AttachmentPoint.MiddleLeft, tr, doc.Database, _config.TextComm);
                              seg.TextCommId = AddToDb(txt, btr, tr);
                         }
@@ -1293,48 +1312,22 @@ namespace CadastreTools
                             radSeg.IsBroken = false; // HEALED
                         }
 
-                        if (radSeg.TextBrgId.IsNull || radSeg.TextBrgId.IsErased || radSeg.TextDistId.IsNull || radSeg.TextDistId.IsErased)
+                        Autodesk.AutoCAD.DatabaseServices.Line lnObj;
+                        if (radSeg.LineId.IsValid && !radSeg.LineId.IsErased)
+                            lnObj = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(radSeg.LineId, OpenMode.ForRead);
+                        else
+                            lnObj = new Autodesk.AutoCAD.DatabaseServices.Line(radSeg.StartPoint, radSeg.EndPoint);
+
+                        double radAngle = (90.0 - CadMath.ParseDmsToDegrees(radSeg.RawAzimuth)) * (Math.PI / 180.0);
+                        var ids = CreateAnnotatedText(btr, tr, lnObj, radSeg.RawAzimuth, radSeg.Distance, radAngle);
+                        radSeg.TextBrgId = ids[0];
+                        radSeg.TextDistId = ids[1];
+
+                        Entity ptTxt = CreateText(radSeg.PointNumber.ToString(), CadConstants.LAY_TXT_PTNUM, radSeg.EndPoint, AttachmentPoint.BottomLeft, tr, doc.Database, _config.TextPt);
+                        radSeg.TextPtId = AddToDb(ptTxt, btr, tr);
+
+                        if (!string.IsNullOrEmpty(radSeg.Comment))
                         {
-                            Autodesk.AutoCAD.DatabaseServices.Line lnObj;
-                            if (radSeg.LineId.IsValid && !radSeg.LineId.IsErased)
-                                lnObj = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(radSeg.LineId, OpenMode.ForRead);
-                            else
-                                lnObj = new Autodesk.AutoCAD.DatabaseServices.Line(radSeg.StartPoint, radSeg.EndPoint);
-
-                            double radAngle = (90.0 - CadMath.ParseDmsToDegrees(radSeg.RawAzimuth)) * (Math.PI / 180.0);
-                            double textRot = radAngle; double norm = radAngle % (Math.PI * 2); if (norm < 0) norm += Math.PI * 2;
-                            if (norm > Math.PI / 2 && norm <= 3 * Math.PI / 2) textRot += Math.PI;
-                            Point3d mid = lnObj.StartPoint + (lnObj.EndPoint - lnObj.StartPoint) / 2.0;
-                            Vector3d up = new Vector3d(-Math.Sin(radAngle), Math.Cos(radAngle), 0); if (norm > Math.PI / 2 && norm <= 3 * Math.PI / 2) up = -up;
-                            Point3d ptBrg = mid + up * _config.TextBrg.Size * 0.7;
-                            Point3d ptDist = mid - up * _config.TextDist.Size * 0.7;
-
-                            // CLEANUP GHOSTS
-                            if (radSeg.TextBrgId.IsValid) EraseId(radSeg.TextBrgId, tr);
-                            else { ObjectId ghost = DwgDataManager.FindTextAtLocation(ptBrg, CadConstants.LAY_TXT_BRG, tr, doc.Database); EraseId(ghost, tr); }
-
-                            if (radSeg.TextDistId.IsValid) EraseId(radSeg.TextDistId, tr);
-                            else { ObjectId ghost = DwgDataManager.FindTextAtLocation(ptDist, CadConstants.LAY_TXT_DIST, tr, doc.Database); EraseId(ghost, tr); }
-
-                            var ids = CreateAnnotatedText(btr, tr, lnObj, radSeg.RawAzimuth, radSeg.Distance, radAngle);
-                            radSeg.TextBrgId = ids[0];
-                            radSeg.TextDistId = ids[1];
-                        }
-
-                        if (radSeg.TextPtId.IsNull || radSeg.TextPtId.IsErased)
-                        {
-                            if (radSeg.TextPtId.IsValid) EraseId(radSeg.TextPtId, tr);
-                            else { ObjectId ghost = DwgDataManager.FindTextAtLocation(radSeg.EndPoint, CadConstants.LAY_TXT_PTNUM, tr, doc.Database); EraseId(ghost, tr); }
-
-                            Entity ptTxt = CreateText(radSeg.PointNumber.ToString(), CadConstants.LAY_TXT_PTNUM, radSeg.EndPoint, AttachmentPoint.BottomLeft, tr, doc.Database, _config.TextPt);
-                            radSeg.TextPtId = AddToDb(ptTxt, btr, tr);
-                        }
-
-                        if ((radSeg.TextCommId.IsNull || radSeg.TextCommId.IsErased) && !string.IsNullOrEmpty(radSeg.Comment))
-                        {
-                             if (radSeg.TextCommId.IsValid) EraseId(radSeg.TextCommId, tr);
-                             else { ObjectId ghost = DwgDataManager.FindTextAtLocation(radSeg.EndPoint, CadConstants.LAY_TXT_SYMB, tr, doc.Database); EraseId(ghost, tr); }
-
                              Entity txt = CreateText(radSeg.Comment, CadConstants.LAY_TXT_SYMB, radSeg.EndPoint, AttachmentPoint.MiddleLeft, tr, doc.Database, _config.TextComm);
                              radSeg.TextCommId = AddToDb(txt, btr, tr);
                         }
