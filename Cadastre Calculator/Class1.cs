@@ -113,6 +113,8 @@ namespace CadastreTools
 
         public string DisplayAzimuth => CadMath.DegreesToDmsFormatted(CadMath.ParseDmsToDegrees(RawAzimuth));
         public string DisplayDist => $"{Distance:0.000}m";
+        public string DisplayType => IsRadiation ? "Rad" : "Main";
+        public string DisplayStatus => IsBroken ? "⚠️" : "🟢";
         public string DisplayLine 
         {
             get
@@ -128,6 +130,8 @@ namespace CadastreTools
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs("DisplayAzimuth"));
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs("DisplayDist"));
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs("DisplayLine"));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs("DisplayType"));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs("DisplayStatus"));
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs("Comment"));
         }
     }
@@ -850,6 +854,152 @@ namespace CadastreTools
                 _logView?.Refresh();
                 UpdateRunningMisclosure();
             }
+            else if (e.GlobalCommandName == "GRIP_STRETCH" || e.GlobalCommandName == "STRETCH" || e.GlobalCommandName == "MOVE")
+            {
+                ProcessManualGripEdits();
+            }
+        }
+
+        private void ProcessManualGripEdits()
+        {
+            var doc = AcApp.DocumentManager.MdiActiveDocument;
+            if (doc == null) return;
+
+            bool changed = false;
+            using (DocumentLock loc = doc.LockDocument())
+            using (Transaction tr = doc.TransactionManager.StartTransaction())
+            {
+                BlockTableRecord btr = (BlockTableRecord)tr.GetObject(doc.Database.CurrentSpaceId, OpenMode.ForWrite);
+
+                foreach (var chain in _allTraverses)
+                {
+                    for (int i = 0; i < chain.Segments.Count; i++)
+                    {
+                        var seg = chain.Segments[i];
+                        if (seg.LineId.IsNull || seg.LineId.IsErased) continue;
+
+                        var ln = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(seg.LineId, OpenMode.ForRead);
+                        Point3d dwgStart = ln.StartPoint;
+                        Point3d dwgEnd = ln.EndPoint;
+                        bool segUpdated = false;
+
+                        // 1. CHECK IF LINE START MOVED (Back-stitch)
+                        if (dwgStart.DistanceTo(seg.StartPoint) > 0.005)
+                        {
+                            Point3d oldStart = seg.StartPoint;
+                            seg.StartPoint = dwgStart;
+                            segUpdated = true;
+
+                            if (i > 0)
+                            {
+                                var prev = chain.Segments[i - 1];
+                                if (prev.EndPoint.DistanceTo(oldStart) < 0.005)
+                                {
+                                    prev.EndPoint = dwgStart;
+                                    UpdateSegmentGeometryAndText(prev, tr, btr);
+                                }
+                            }
+                        }
+
+                        // 2. CHECK IF LINE END MOVED (Forward-stitch / Propagate)
+                        if (dwgEnd.DistanceTo(seg.EndPoint) > 0.005)
+                        {
+                            Point3d oldEnd = seg.EndPoint;
+                            Vector3d delta = dwgEnd - oldEnd;
+                            seg.EndPoint = dwgEnd;
+                            segUpdated = true;
+
+                            if (i < chain.Segments.Count - 1)
+                            {
+                                var next = chain.Segments[i + 1];
+                                if (next.StartPoint.DistanceTo(oldEnd) < 0.005)
+                                {
+                                    bool nextAlreadyMoved = false;
+                                    if (next.LineId.IsValid && !next.LineId.IsErased)
+                                    {
+                                        var nextLn = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(next.LineId, OpenMode.ForRead);
+                                        if (nextLn.StartPoint.DistanceTo(dwgEnd) < 0.005) nextAlreadyMoved = true;
+                                    }
+
+                                    if (!nextAlreadyMoved)
+                                    {
+                                        PropagateShift(oldEnd, Matrix3d.Displacement(delta), tr, new HashSet<ObjectId> { seg.LineId });
+                                    }
+                                }
+                            }
+                        }
+
+                        // 3. CHECK IF POINT NUMBER TEXT MOVED (Treat as Station Move)
+                        if (!segUpdated && seg.TextPtId.IsValid && !seg.TextPtId.IsErased)
+                        {
+                            Entity txt = (Entity)tr.GetObject(seg.TextPtId, OpenMode.ForRead);
+                            Point3d txtPos = (txt is DBText d) ? d.Position : ((MText)txt).Location;
+                            
+                            if (txtPos.DistanceTo(seg.EndPoint) > 0.005)
+                            {
+                                Vector3d delta = txtPos - seg.EndPoint;
+                                Point3d oldEnd = seg.EndPoint;
+                                seg.EndPoint = txtPos;
+                                var lObj = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(seg.LineId, OpenMode.ForWrite);
+                                lObj.EndPoint = txtPos;
+                                segUpdated = true;
+
+                                if (i < chain.Segments.Count - 1)
+                                {
+                                     var next = chain.Segments[i+1];
+                                     if (next.StartPoint.DistanceTo(oldEnd) < 0.005)
+                                     {
+                                         PropagateShift(oldEnd, Matrix3d.Displacement(delta), tr, new HashSet<ObjectId> { seg.LineId });
+                                     }
+                                }
+                            }
+                        }
+
+                        if (segUpdated)
+                        {
+                            UpdateSegmentGeometryAndText(seg, tr, btr);
+                            if (seg.TextPtId.IsValid && !seg.TextPtId.IsErased)
+                            {
+                                Entity txt = (Entity)tr.GetObject(seg.TextPtId, OpenMode.ForWrite);
+                                Point3d currentPos = (txt is DBText d) ? d.Position : ((MText)txt).Location;
+                                if (currentPos.DistanceTo(seg.EndPoint) > 0.005)
+                                {
+                                    if (txt is DBText dt) dt.Position = seg.EndPoint;
+                                    else if (txt is MText mt) mt.Location = seg.EndPoint;
+                                }
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+
+                if (changed)
+                {
+                    tr.Commit();
+                    doc.Editor.UpdateScreen();
+                    SyncCurrentState();
+                    SaveState();
+                }
+            }
+        }
+
+        private void UpdateSegmentGeometryAndText(TraverseSegment seg, Transaction tr, BlockTableRecord btr)
+        {
+            Vector3d v = seg.EndPoint - seg.StartPoint;
+            seg.Distance = v.Length;
+            double rad = Math.Atan2(v.Y, v.X);
+            double deg = (90.0 - (rad * 180.0 / Math.PI));
+            while (deg < 0) deg += 360; deg %= 360;
+            seg.RawAzimuth = double.Parse(CadMath.DegreesToDmsString(deg));
+            seg.NotifyUpdate();
+
+            EraseId(seg.TextBrgId, tr);
+            EraseId(seg.TextDistId, tr);
+            
+            var ln = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(seg.LineId, OpenMode.ForRead);
+            var ids = CreateAnnotatedText(btr, tr, ln, seg.RawAzimuth, seg.Distance, rad);
+            seg.TextBrgId = ids[0];
+            seg.TextDistId = ids[1];
         }
 
         private void SyncDatabaseToDrawing()
@@ -1053,19 +1203,24 @@ namespace CadastreTools
             header.ColumnDefinitions.Add(new ColumnDefinition() { Width = GridLength.Auto });
             header.ColumnDefinitions.Add(new ColumnDefinition() { Width = GridLength.Auto });
             header.ColumnDefinitions.Add(new ColumnDefinition() { Width = GridLength.Auto });
+            header.ColumnDefinitions.Add(new ColumnDefinition() { Width = GridLength.Auto });
             TextBlock title = new TextBlock() { Text = " CADASTRE PRO", VerticalAlignment = VerticalAlignment.Center, Foreground = System.Windows.Media.Brushes.White, FontWeight = FontWeights.Bold, FontSize = 18, Margin = new Thickness(10, 0, 0, 0) };
             Wpf.Button btnReload = new Wpf.Button() { Content = "↻", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.Cyan, BorderThickness = new Thickness(0), FontSize = 24, ToolTip = "Reload Database from XML", FontWeight = FontWeights.Bold };
             btnReload.Click += (s, e) => ReloadDataFromDwg();
             Wpf.Button btnRedraft = new Wpf.Button() { Content = "✎", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.Yellow, BorderThickness = new Thickness(0), FontSize = 24, ToolTip = "Redraft Missing Entities", FontWeight = FontWeights.Bold };
             btnRedraft.Click += RedraftTraverses_Click;
+            
+            Wpf.Button btnHeal = new Wpf.Button() { Content = "🩹", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.Orange, BorderThickness = new Thickness(0), FontSize = 20, ToolTip = "Heal Drawing & Sync Database" };
+            btnHeal.Click += HealAndSync_Click;
+
             Wpf.Button btnConnect = new Wpf.Button() { Content = "🔗", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.LimeGreen, BorderThickness = new Thickness(0), FontSize = 20, ToolTip = "Connect Database File" };
             btnConnect.Click += ConnectDatabase_Click;
             Wpf.Button btnSettings = new Wpf.Button() { Content = "?", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.White, BorderThickness = new Thickness(0), FontSize = 20 };
             btnSettings.Click += (s, e) => ShowSettingsOverlay();
             Wpf.Button btnAbout = new Wpf.Button() { Content = "?", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.White, BorderThickness = new Thickness(0), FontSize = 20 };
             btnAbout.Click += (s, e) => System.Windows.MessageBox.Show("Cadastre Pro V3.5\nData Persistence Active");
-            Grid.SetColumn(title, 0); Grid.SetColumn(btnReload, 1); Grid.SetColumn(btnRedraft, 2); Grid.SetColumn(btnConnect, 3); Grid.SetColumn(btnSettings, 4); Grid.SetColumn(btnAbout, 5);
-            header.Children.Add(title); header.Children.Add(btnReload); header.Children.Add(btnRedraft); header.Children.Add(btnConnect); header.Children.Add(btnSettings); header.Children.Add(btnAbout);
+            Grid.SetColumn(title, 0); Grid.SetColumn(btnReload, 1); Grid.SetColumn(btnRedraft, 2); Grid.SetColumn(btnHeal, 3); Grid.SetColumn(btnConnect, 4); Grid.SetColumn(btnSettings, 5); Grid.SetColumn(btnAbout, 6);
+            header.Children.Add(title); header.Children.Add(btnReload); header.Children.Add(btnRedraft); header.Children.Add(btnHeal); header.Children.Add(btnConnect); header.Children.Add(btnSettings); header.Children.Add(btnAbout);
             Grid.SetRow(header, 0); mainGrid.Children.Add(header);
 
             // INPUTS
@@ -1105,15 +1260,72 @@ namespace CadastreTools
                 }
                 return true;
             };
+            
+            // GROUPING
+            _logView.GroupDescriptions.Add(new PropertyGroupDescription("TraverseId"));
 
             GridView grid = new GridView();
-            grid.Columns.Add(new GridViewColumn() { Header = "LINE / PT", Width = 110, DisplayMemberBinding = new System.Windows.Data.Binding("DisplayLine") });
-            grid.Columns.Add(new GridViewColumn() { Header = "AZIMUTH", Width = 90, DisplayMemberBinding = new System.Windows.Data.Binding("DisplayAzimuth") });
-            grid.Columns.Add(new GridViewColumn() { Header = "DISTANCE", Width = 70, DisplayMemberBinding = new System.Windows.Data.Binding("DisplayDist") });
-            grid.Columns.Add(new GridViewColumn() { Header = "COMMENT", Width = 100, DisplayMemberBinding = new System.Windows.Data.Binding("Comment") });
+            
+            // Status
+            DataTemplate statusTemp = new DataTemplate();
+            FrameworkElementFactory statusFact = new FrameworkElementFactory(typeof(TextBlock));
+            statusFact.SetBinding(TextBlock.TextProperty, new System.Windows.Data.Binding("DisplayStatus"));
+            statusFact.SetValue(TextBlock.HorizontalAlignmentProperty, System.Windows.HorizontalAlignment.Center);
+            statusTemp.VisualTree = statusFact;
+            grid.Columns.Add(new GridViewColumn() { Header = "St", Width = 30, CellTemplate = statusTemp });
+
+            // Type
+            grid.Columns.Add(new GridViewColumn() { Header = "Type", Width = 40, DisplayMemberBinding = new System.Windows.Data.Binding("DisplayType") });
+
+            // Line/Pt
+            grid.Columns.Add(new GridViewColumn() { Header = "Line / Pt", Width = 110, DisplayMemberBinding = new System.Windows.Data.Binding("DisplayLine") });
+
+            // Azimuth (Right Align)
+            DataTemplate azTemp = new DataTemplate();
+            FrameworkElementFactory azFact = new FrameworkElementFactory(typeof(TextBlock));
+            azFact.SetBinding(TextBlock.TextProperty, new System.Windows.Data.Binding("DisplayAzimuth"));
+            azFact.SetValue(TextBlock.TextAlignmentProperty, System.Windows.TextAlignment.Right);
+            azTemp.VisualTree = azFact;
+            grid.Columns.Add(new GridViewColumn() { Header = "Azimuth", Width = 90, CellTemplate = azTemp });
+
+            // Distance (Right Align)
+            DataTemplate distTemp = new DataTemplate();
+            FrameworkElementFactory distFact = new FrameworkElementFactory(typeof(TextBlock));
+            distFact.SetBinding(TextBlock.TextProperty, new System.Windows.Data.Binding("DisplayDist"));
+            distFact.SetValue(TextBlock.TextAlignmentProperty, System.Windows.TextAlignment.Right);
+            distTemp.VisualTree = distFact;
+            grid.Columns.Add(new GridViewColumn() { Header = "Dist", Width = 70, CellTemplate = distTemp });
+
+            grid.Columns.Add(new GridViewColumn() { Header = "Comment", Width = 100, DisplayMemberBinding = new System.Windows.Data.Binding("Comment") });
+
             lstHistory.View = grid;
             lstHistory.MouseDoubleClick += LstHistory_MouseDoubleClick;
             lstHistory.SelectionChanged += LstHistory_SelectionChanged;
+            lstHistory.AddHandler(GridViewColumnHeader.ClickEvent, new RoutedEventHandler(ColumnHeader_Click));
+
+            // CONTEXT MENU
+            Wpf.ContextMenu ctx = new Wpf.ContextMenu();
+            Wpf.MenuItem miHighlight = new Wpf.MenuItem() { Header = "Highlight in CAD" };
+            miHighlight.Click += MenuHighlight_Click;
+            ctx.Items.Add(miHighlight);
+            Wpf.MenuItem miDelete = new Wpf.MenuItem() { Header = "Delete Segment" };
+            miDelete.Click += MenuDelete_Click;
+            ctx.Items.Add(miDelete);
+            Wpf.MenuItem miEdit = new Wpf.MenuItem() { Header = "Edit Properties" };
+            miEdit.Click += MenuEdit_Click;
+            ctx.Items.Add(miEdit);
+            Wpf.MenuItem miRad = new Wpf.MenuItem() { Header = "Radiate from End" };
+            miRad.Click += MenuRadiate_Click;
+            ctx.Items.Add(miRad);
+            lstHistory.ContextMenu = ctx;
+
+            // STYLING ROW
+            Style itemStyle = new Style(typeof(System.Windows.Controls.ListViewItem));
+            DataTrigger brokenTrigger = new DataTrigger() { Binding = new System.Windows.Data.Binding("IsBroken"), Value = true };
+            brokenTrigger.Setters.Add(new Setter(System.Windows.Controls.ListViewItem.ForegroundProperty, System.Windows.Media.Brushes.IndianRed));
+            itemStyle.Triggers.Add(brokenTrigger);
+            lstHistory.ItemContainerStyle = itemStyle;
+
             Grid.SetRow(lstHistory, 2); mainGrid.Children.Add(lstHistory);
 
             // TRAVERSE TOGGLE
@@ -1166,6 +1378,165 @@ namespace CadastreTools
             rootGrid.Children.Add(_overlayContainer);
             this.Content = rootGrid;
             this.PreviewKeyDown += Control_PreviewKeyDown;
+        }
+
+        private void ColumnHeader_Click(object sender, RoutedEventArgs e)
+        {
+            if (e.OriginalSource is GridViewColumnHeader header && header.Column != null)
+            {
+                string sortBy = header.Column.Header.ToString();
+                switch (sortBy)
+                {
+                    case "St": sortBy = "IsBroken"; break;
+                    case "Type": sortBy = "IsRadiation"; break;
+                    case "Line / Pt": sortBy = "PointNumber"; break;
+                    case "Azimuth": sortBy = "RawAzimuth"; break;
+                    case "Dist": sortBy = "Distance"; break;
+                    case "Comment": sortBy = "Comment"; break;
+                    default: return;
+                }
+
+                ListSortDirection direction = ListSortDirection.Ascending;
+                if (_logView.SortDescriptions.Count > 0 && _logView.SortDescriptions[0].PropertyName == sortBy)
+                {
+                    direction = (_logView.SortDescriptions[0].Direction == ListSortDirection.Ascending) ? ListSortDirection.Descending : ListSortDirection.Ascending;
+                }
+                _logView.SortDescriptions.Clear();
+                _logView.SortDescriptions.Add(new SortDescription(sortBy, direction));
+            }
+        }
+
+        private void MenuHighlight_Click(object sender, RoutedEventArgs e)
+        {
+            if (lstHistory.SelectedItem is TraverseSegment seg && seg.LineId.IsValid && !seg.LineId.IsErased)
+            {
+                var doc = AcApp.DocumentManager.MdiActiveDocument;
+                doc.Editor.SetImpliedSelection(new ObjectId[] { seg.LineId });
+                PanToPoint(seg.EndPoint);
+                doc.Window.Focus();
+            }
+        }
+
+        private void MenuDelete_Click(object sender, RoutedEventArgs e)
+        {
+            if (lstHistory.SelectedItem is TraverseSegment seg)
+            {
+                DeleteSegmentAndStitch(seg);
+                RefreshTraverseList();
+                UpdateRunningMisclosure();
+            }
+        }
+
+        private void MenuEdit_Click(object sender, RoutedEventArgs e)
+        {
+             LstHistory_MouseDoubleClick(lstHistory, null);
+        }
+
+        private void MenuRadiate_Click(object sender, RoutedEventArgs e)
+        {
+            if (lstHistory.SelectedItem is TraverseSegment seg && !seg.IsRadiation)
+            {
+                ShowRadiationOverlay(seg.EndPoint);
+            }
+        }
+
+        private void HealAndSync_Click(object sender, RoutedEventArgs e)
+        {
+            var doc = AcApp.DocumentManager.MdiActiveDocument;
+            if (doc == null) return;
+            int reconciled = 0;
+
+            using (DocumentLock loc = doc.LockDocument())
+            using (Transaction tr = doc.TransactionManager.StartTransaction())
+            {
+                BlockTableRecord btr = (BlockTableRecord)tr.GetObject(doc.Database.CurrentSpaceId, OpenMode.ForWrite);
+
+                // 1. GEOMETRIC ALIGNMENT & RECOVERY
+                foreach (var chain in _allTraverses)
+                {
+                    foreach (var seg in chain.Segments.Concat(chain.Radiations))
+                    {
+                        // Try to recover lost handle
+                        if (seg.LineId.IsNull || seg.LineId.IsErased)
+                        {
+                            foreach (ObjectId id in btr)
+                            {
+                                if (id.ObjectClass.IsDerivedFrom(RXClass.GetClass(typeof(Autodesk.AutoCAD.DatabaseServices.Line))))
+                                {
+                                    var ln = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(id, OpenMode.ForRead);
+                                    if (ln.StartPoint.DistanceTo(seg.StartPoint) < 0.01 && ln.EndPoint.DistanceTo(seg.EndPoint) < 0.01)
+                                    {
+                                        seg.LineId = id;
+                                        seg.IsBroken = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Align Memory to CAD
+                        if (seg.LineId.IsValid && !seg.LineId.IsErased)
+                        {
+                            var ln = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(seg.LineId, OpenMode.ForRead);
+                            
+                            seg.StartPoint = ln.StartPoint;
+                            seg.EndPoint = ln.EndPoint;
+                            
+                            Vector3d v = seg.EndPoint - seg.StartPoint;
+                            seg.Distance = v.Length;
+                            double rad = Math.Atan2(v.Y, v.X);
+                            double deg = (90.0 - (rad * 180.0 / Math.PI));
+                            while (deg < 0) deg += 360; deg %= 360;
+                            seg.RawAzimuth = double.Parse(CadMath.DegreesToDmsString(deg));
+                            reconciled++;
+                        }
+                    }
+                }
+
+                // 2. CLEANUP & RE-ANNOTATION
+                foreach (var chain in _allTraverses)
+                {
+                    foreach (var seg in chain.Segments.Concat(chain.Radiations))
+                    {
+                        EraseId(seg.TextBrgId, tr);
+                        EraseId(seg.TextDistId, tr);
+                        
+                        if (seg.LineId.IsValid && !seg.LineId.IsErased)
+                        {
+                            var ln = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(seg.LineId, OpenMode.ForRead);
+                            double rad = (90.0 - CadMath.ParseDmsToDegrees(seg.RawAzimuth)) * (Math.PI / 180.0);
+
+                            var ids = CreateAnnotatedText(btr, tr, ln, seg.RawAzimuth, seg.Distance, rad);
+                            seg.TextBrgId = ids[0];
+                            seg.TextDistId = ids[1];
+                            
+                            // Point Num Check
+                            if (seg.TextPtId.IsNull || seg.TextPtId.IsErased)
+                            {
+                                Entity ptTxt = CreateText(seg.PointNumber.ToString(), CadConstants.LAY_TXT_PTNUM, seg.EndPoint, AttachmentPoint.BottomLeft, tr, doc.Database, _config.TextPt);
+                                seg.TextPtId = AddToDb(ptTxt, btr, tr);
+                            }
+                            else
+                            {
+                                // Ensure position
+                                Entity ptTxt = (Entity)tr.GetObject(seg.TextPtId, OpenMode.ForWrite);
+                                if (ptTxt is DBText dt) dt.Position = seg.EndPoint;
+                                else if (ptTxt is MText mt) mt.Location = seg.EndPoint;
+                            }
+                            
+                            seg.NotifyUpdate();
+                        }
+                    }
+                }
+
+                tr.Commit();
+                doc.Editor.UpdateScreen();
+            }
+
+            RefreshTraverseList();
+            SyncCurrentState();
+            UpdateRunningMisclosure();
+            if (lblStatus != null) lblStatus.Content = $"Healing Complete: {reconciled} segments reconciled.";
         }
 
         private void ConnectDatabase_Click(object sender, RoutedEventArgs e)
@@ -1811,7 +2182,7 @@ namespace CadastreTools
                     chain.Segments.Insert(idx, newSeg);
                     _logItems.Insert(_logItems.IndexOf(refSeg) + (before ? 0 : 1), newSeg);
 
-                    PropagateShift(newSeg, Matrix3d.Displacement(shift), tr);
+                    PropagateShift(start, Matrix3d.Displacement(shift), tr, new HashSet<ObjectId> { newSeg.LineId });
                     RenumberTraversePoints(chain, tr);
                     tr.Commit(); doc.Editor.Regen();
                 }
@@ -1830,8 +2201,10 @@ namespace CadastreTools
                 {
                     double oldRad = (90 - CadMath.ParseDmsToDegrees(seg.RawAzimuth)) * Math.PI / 180;
                     double newRad = (90 - CadMath.ParseDmsToDegrees(newAz)) * Math.PI / 180;
+                    
+                    Point3d oldEnd = new Point3d(seg.StartPoint.X + (seg.Distance * Math.Cos(oldRad)), seg.StartPoint.Y + (seg.Distance * Math.Sin(oldRad)), seg.StartPoint.Z);
                     Point3d newEnd = new Point3d(seg.StartPoint.X + (newDist * Math.Cos(newRad)), seg.StartPoint.Y + (newDist * Math.Sin(newRad)), seg.StartPoint.Z);
-                    Vector3d delta = newEnd - new Point3d(seg.StartPoint.X + (seg.Distance * Math.Cos(oldRad)), seg.StartPoint.Y + (seg.Distance * Math.Sin(oldRad)), seg.StartPoint.Z);
+                    Vector3d delta = newEnd - oldEnd;
 
                     if (!seg.LineId.IsErased) { ((Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(seg.LineId, OpenMode.ForWrite)).EndPoint = newEnd; }
                     EraseId(seg.TextBrgId, tr); EraseId(seg.TextDistId, tr);
@@ -1851,7 +2224,7 @@ namespace CadastreTools
                     }
                     else
                     {
-                        PropagateShift(seg, Matrix3d.Displacement(delta), tr);
+                        PropagateShift(oldEnd, Matrix3d.Displacement(delta), tr, new HashSet<ObjectId> { seg.LineId });
                     }
                     tr.Commit(); doc.Editor.Regen(); UpdateRunningMisclosure(); CalculateArea();
                 }
@@ -1881,13 +2254,16 @@ namespace CadastreTools
                     else
                     {
                         Vector3d delta = seg.StartPoint - seg.EndPoint;
-                        PropagateShift(seg, Matrix3d.Displacement(delta), tr);
+                        PropagateShift(seg.EndPoint, Matrix3d.Displacement(delta), tr, new HashSet<ObjectId> { seg.LineId });
 
                         // Update radiations attached to this point to follow the stitch back to start point
                         foreach (var rad in chain.Radiations)
                         {
                             if (rad.ParentStationId == seg.PointNumber)
+                            {
                                 rad.ParentStationId = seg.FromPoint;
+                                rad.NotifyUpdate();
+                            }
                         }
 
                         chain.Segments.Remove(seg);
@@ -1901,36 +2277,53 @@ namespace CadastreTools
             SaveState();
         }
 
-        private void PropagateShift(TraverseSegment seg, Matrix3d matMove, Transaction tr)
+        private void PropagateShift(Point3d pivot, Matrix3d mat, Transaction tr, HashSet<ObjectId> visited = null)
         {
-            var chain = _allTraverses.FirstOrDefault(t => t.Id == seg.TraverseId);
-            if (chain != null)
+            if (visited == null) visited = new HashSet<ObjectId>();
+            double tol = _config.SnapTolerance;
+
+            foreach (var chain in _allTraverses)
             {
-                int idx = chain.Segments.IndexOf(seg);
-                if (idx == -1) return;
-
-                // Track all points that are moving
-                HashSet<int> movingStations = new HashSet<int>();
-                movingStations.Add(seg.PointNumber);
-
-                for (int i = idx + 1; i < chain.Segments.Count; i++)
+                if (chain.OriginPoint.DistanceTo(pivot) < tol)
                 {
-                    var sub = chain.Segments[i];
-                    movingStations.Add(sub.PointNumber);
-
-                    sub.StartPoint = sub.StartPoint.TransformBy(matMove);
-                    sub.EndPoint = sub.EndPoint.TransformBy(matMove);
-                    TransformEntity(sub.LineId, matMove, tr); TransformEntity(sub.TextBrgId, matMove, tr); TransformEntity(sub.TextDistId, matMove, tr); TransformEntity(sub.TextPtId, matMove, tr); TransformEntity(sub.TextCommId, matMove, tr);
+                    chain.OriginPoint = chain.OriginPoint.TransformBy(mat);
+                    TransformEntity(chain.TextOriginId, mat, tr);
                 }
 
-                // Update ALL radiations attached to any moving station
+                foreach (var seg in chain.Segments)
+                {
+                    if (visited.Contains(seg.LineId)) continue;
+
+                    if (seg.StartPoint.DistanceTo(pivot) < tol)
+                    {
+                        visited.Add(seg.LineId);
+                        Point3d oldEnd = seg.EndPoint; // Capture before move
+                        
+                        seg.StartPoint = seg.StartPoint.TransformBy(mat);
+                        seg.EndPoint = seg.EndPoint.TransformBy(mat);
+                        TransformEntity(seg.LineId, mat, tr);
+                        TransformEntity(seg.TextBrgId, mat, tr);
+                        TransformEntity(seg.TextDistId, mat, tr);
+                        TransformEntity(seg.TextPtId, mat, tr);
+                        TransformEntity(seg.TextCommId, mat, tr);
+                        
+                        PropagateShift(oldEnd, mat, tr, visited);
+                    }
+                }
+
                 foreach (var rad in chain.Radiations)
                 {
-                    if (movingStations.Contains(rad.ParentStationId))
+                    if (visited.Contains(rad.LineId)) continue;
+                    if (rad.StartPoint.DistanceTo(pivot) < tol)
                     {
-                        rad.StartPoint = rad.StartPoint.TransformBy(matMove);
-                        rad.EndPoint = rad.EndPoint.TransformBy(matMove);
-                        TransformEntity(rad.LineId, matMove, tr); TransformEntity(rad.TextBrgId, matMove, tr); TransformEntity(rad.TextDistId, matMove, tr); TransformEntity(rad.TextPtId, matMove, tr); TransformEntity(rad.TextCommId, matMove, tr);
+                        visited.Add(rad.LineId);
+                        rad.StartPoint = rad.StartPoint.TransformBy(mat);
+                        rad.EndPoint = rad.EndPoint.TransformBy(mat);
+                        TransformEntity(rad.LineId, mat, tr);
+                        TransformEntity(rad.TextBrgId, mat, tr);
+                        TransformEntity(rad.TextDistId, mat, tr);
+                        TransformEntity(rad.TextPtId, mat, tr);
+                        TransformEntity(rad.TextCommId, mat, tr);
                     }
                 }
             }
@@ -1961,13 +2354,23 @@ namespace CadastreTools
                 }
             }
 
-            // Update radiations to maintain attachment to their stations
-            foreach (var rad in chain.Radiations)
+            // Update radiations to maintain attachment and re-sequence point numbers
+            for (int i = 0; i < chain.Radiations.Count; i++)
             {
+                var rad = chain.Radiations[i];
+
                 if (pointMap.ContainsKey(rad.ParentStationId))
                 {
                     rad.ParentStationId = pointMap[rad.ParentStationId];
-                    rad.NotifyUpdate();
+                }
+
+                rad.PointNumber = baseNum + 900 + (i + 1);
+                rad.NotifyUpdate();
+
+                if (!rad.TextPtId.IsErased)
+                {
+                    Entity ent = (Entity)tr.GetObject(rad.TextPtId, OpenMode.ForWrite);
+                    if (ent is DBText dt) dt.TextString = rad.PointNumber.ToString(); else if (ent is MText mt) mt.Contents = rad.PointNumber.ToString();
                 }
             }
         }
