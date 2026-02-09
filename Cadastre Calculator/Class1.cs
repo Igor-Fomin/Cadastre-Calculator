@@ -101,6 +101,7 @@ namespace CadastreTools
         public Point3d StartPoint { get; set; }
         public Point3d EndPoint { get; set; }
         public bool IsRadiation { get; set; } = false;
+        public bool IsBroken { get; set; } = false;
 
         // Runtime ObjectIds
         public ObjectId LineId { get; set; }
@@ -111,7 +112,14 @@ namespace CadastreTools
 
         public string DisplayAzimuth => CadMath.DegreesToDmsFormatted(CadMath.ParseDmsToDegrees(RawAzimuth));
         public string DisplayDist => $"{Distance:0.000}m";
-        public string DisplayLine => IsRadiation ? $"RAD {ParentStationId}->{PointNumber}" : $"{FromPoint} -> {PointNumber}";
+        public string DisplayLine 
+        {
+            get
+            {
+                string baseTxt = IsRadiation ? $"RAD {ParentStationId}->{PointNumber}" : $"{FromPoint} -> {PointNumber}";
+                return IsBroken ? $"[MISSING] {baseTxt}" : baseTxt;
+            }
+        }
 
         public event PropertyChangedEventHandler PropertyChanged;
         public void NotifyUpdate()
@@ -308,13 +316,28 @@ namespace CadastreTools
             };
         }
 
-        private static ObjectId Resolve(string h, Database db)
+        private static ObjectId Resolve(string h, Database db, Point3d? expectedPos = null)
         {
             if (string.IsNullOrEmpty(h)) return ObjectId.Null;
             try 
             { 
                 ObjectId id = db.GetObjectId(false, new Handle(Convert.ToInt64(h, 16)), 0);
                 if (id.IsErased) return ObjectId.Null;
+
+                if (expectedPos.HasValue)
+                {
+                    using (var tr = db.TransactionManager.StartOpenCloseTransaction())
+                    {
+                        Entity ent = (Entity)tr.GetObject(id, OpenMode.ForRead);
+                        Point3d actualPos = Point3d.Origin;
+                        if (ent is Autodesk.AutoCAD.DatabaseServices.Line ln) actualPos = ln.StartPoint;
+                        else if (ent is DBText dt) actualPos = dt.Position;
+                        else if (ent is MText mt) actualPos = mt.Location;
+
+                        // If moved more than 1mm, consider the handle stale
+                        if (actualPos.DistanceTo(expectedPos.Value) > 0.001) return ObjectId.Null;
+                    }
+                }
                 return id;
             } 
             catch { return ObjectId.Null; }
@@ -322,6 +345,11 @@ namespace CadastreTools
 
         private static TraverseSegment RebuildSeg(DtoSegment d, Database db)
         {
+            Point3d start = new Point3d(d.StartX, d.StartY, d.StartZ);
+            Point3d end = new Point3d(d.EndX, d.EndY, d.EndZ);
+            
+            ObjectId lineId = Resolve(d.HandleLine, db, start);
+
             return new TraverseSegment()
             {
                 TraverseId = d.TraverseId,
@@ -333,14 +361,48 @@ namespace CadastreTools
                 Distance = d.Distance,
                 Comment = d.Comment,
                 IsRadiation = d.IsRadiation,
-                StartPoint = new Point3d(d.StartX, d.StartY, d.StartZ),
-                EndPoint = new Point3d(d.EndX, d.EndY, d.EndZ),
-                LineId = Resolve(d.HandleLine, db),
+                StartPoint = start,
+                EndPoint = end,
+                LineId = lineId,
                 TextBrgId = Resolve(d.HandleTxtBrg, db),
                 TextDistId = Resolve(d.HandleTxtDist, db),
-                TextPtId = Resolve(d.HandleTxtPt, db),
-                TextCommId = Resolve(d.HandleTxtComm, db)
+                TextPtId = Resolve(d.HandleTxtPt, db, end),
+                TextCommId = Resolve(d.HandleTxtComm, db, end),
+                IsBroken = lineId.IsNull
             };
+        }
+
+        public static void SyncXmlToDwg(List<TraverseChain> traverses)
+        {
+            var doc = AcApp.DocumentManager.MdiActiveDocument;
+            if (doc == null) return;
+
+            using (var tr = doc.TransactionManager.StartTransaction())
+            {
+                foreach (var chain in traverses)
+                {
+                    foreach (var seg in chain.Segments.Concat(chain.Radiations))
+                    {
+                        if (seg.LineId.IsValid && !seg.LineId.IsErased)
+                        {
+                            var ln = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(seg.LineId, OpenMode.ForRead);
+                            if (ln.StartPoint.DistanceTo(seg.StartPoint) > 0.001 || ln.EndPoint.DistanceTo(seg.EndPoint) > 0.001)
+                            {
+                                seg.StartPoint = ln.StartPoint;
+                                seg.EndPoint = ln.EndPoint;
+                                Vector3d v = seg.EndPoint - seg.StartPoint;
+                                seg.Distance = v.Length;
+                                double rad = Math.Atan2(v.Y, v.X);
+                                double deg = (90.0 - (rad * 180.0 / Math.PI));
+                                while (deg < 0) deg += 360; deg %= 360;
+                                seg.RawAzimuth = double.Parse(CadMath.DegreesToDmsString(deg));
+                                seg.NotifyUpdate();
+                            }
+                        }
+                    }
+                }
+                tr.Commit();
+            }
         }
     }
     // --- 5. SETTINGS ---
@@ -750,32 +812,77 @@ namespace CadastreTools
         {
             if (_allTraverses.Count > 0)
             {
-                if (_currentTraverse == null || !_allTraverses.Contains(_currentTraverse))
+                // FIND LOGICAL CONTINUITY (Closest to last known point)
+                TraverseChain bestChain = _allTraverses.Last();
+                TraverseSegment bestSeg = null;
+                double minDist = double.MaxValue;
+
+                foreach (var chain in _allTraverses)
                 {
-                    _currentTraverse = _allTraverses.Last();
+                    double dOrg = chain.OriginPoint.DistanceTo(_currentPoint);
+                    if (dOrg < minDist) { minDist = dOrg; bestChain = chain; bestSeg = null; }
+
+                    foreach (var seg in chain.Segments)
+                    {
+                        double d = seg.EndPoint.DistanceTo(_currentPoint);
+                        if (d < minDist) { minDist = d; bestChain = chain; bestSeg = seg; }
+                    }
                 }
 
-                if (_currentTraverse.Segments.Count > 0)
+                if (minDist < 0.005) // Snapped within tolerance
                 {
-                    var lastSeg = _currentTraverse.Segments.Last();
-                    _currentPoint = lastSeg.EndPoint;
-                    _lastPtNum = lastSeg.PointNumber;
-                    _traversePath.Clear();
-                    _traversePath.Add(_currentTraverse.OriginPoint);
-                    foreach (var s in _currentTraverse.Segments) _traversePath.Add(s.EndPoint);
+                    _currentTraverse = bestChain;
+                    if (bestSeg != null)
+                    {
+                        _currentPoint = bestSeg.EndPoint;
+                        _lastPtNum = bestSeg.PointNumber;
+                    }
+                    else
+                    {
+                        _currentPoint = _currentTraverse.OriginPoint;
+                        _lastPtNum = _currentTraverse.ChainIndex * 1000 + 1;
+                    }
                 }
                 else
                 {
-                    _currentPoint = _currentTraverse.OriginPoint;
-                    _traversePath.Clear(); _traversePath.Add(_currentPoint);
+                    _currentTraverse = _allTraverses.Last();
+                    if (_currentTraverse.Segments.Count > 0)
+                    {
+                        var lastSeg = _currentTraverse.Segments.Last();
+                        _currentPoint = lastSeg.EndPoint;
+                        _lastPtNum = lastSeg.PointNumber;
+                    }
+                    else
+                    {
+                        _currentPoint = _currentTraverse.OriginPoint;
+                        _lastPtNum = _currentTraverse.ChainIndex * 1000 + 1;
+                    }
                 }
+
+                _traversePath.Clear();
+                _traversePath.Add(_currentTraverse.OriginPoint);
+                foreach (var s in _currentTraverse.Segments) _traversePath.Add(s.EndPoint);
+                
                 UpdateRunningMisclosure(); CalculateArea();
+                UpdateActiveGuide();
             }
             else
             {
                 _currentTraverse = null;
                 _traversePath.Clear();
-                // Note: _lastPtNum might have been set by the fallback scan in ReloadDataFromDwg
+                UpdateGuideText("PICK START POINT");
+            }
+        }
+
+        private void UpdateActiveGuide()
+        {
+            if (_currentTraverse != null)
+            {
+                UpdateGuideText($"ACTIVE: {_currentTraverse.Id} | AT PT #{_lastPtNum}");
+            }
+            else
+            {
+                UpdateGuideText("PICK START POINT");
             }
         }
 
@@ -1219,7 +1326,7 @@ namespace CadastreTools
                 _currentTraverse.TextOriginId = AddToDb(ptTxt, btr, tr);
                 tr.Commit();
             }
-            UpdateRunningMisclosure(); CalculateArea(); UpdateGuideText("ENTER AZIMUTH/DIST"); lblStatus.Content = $"Traverse {traverseNum} Started.";
+            UpdateRunningMisclosure(); CalculateArea(); UpdateActiveGuide(); lblStatus.Content = $"Traverse {traverseNum} Started.";
             PanToPoint(start);
             _lastPtNum = firstPt;
             SaveState();
@@ -1308,6 +1415,12 @@ namespace CadastreTools
             {
                 try
                 {
+                    // FORCE EXACT ENDPOINT TO PREVENT DRIFT
+                    if (_currentTraverse != null && _currentTraverse.Segments.Count > 0)
+                    {
+                        _currentPoint = _currentTraverse.Segments.Last().EndPoint;
+                    }
+
                     string finalAz = CadMath.EvaluateMath(txtAzimuth.Text);
                     string finalDist = CadMath.EvaluateMath(txtDistance.Text);
 
@@ -1352,7 +1465,7 @@ namespace CadastreTools
                     _lastPtNum = toPt;
 
                     _currentPoint = endPoint; _traversePath.Add(endPoint);
-                    UpdateRunningMisclosure(); CalculateArea(); PlayAudio(); PanToPoint(endPoint); doc.Editor.UpdateScreen();
+                    UpdateRunningMisclosure(); CalculateArea(); UpdateActiveGuide(); PlayAudio(); PanToPoint(endPoint); doc.Editor.UpdateScreen();
                     SaveState(); // PERSIST
 
                     // PERSISTENCE: Don't clear inputs. Focus back.
@@ -1727,6 +1840,22 @@ namespace CadastreTools
         }
         private Point3d CheckSnapping(Point3d target, Transaction tr, BlockTableRecord btr)
         {
+            var priorityLayers = new HashSet<string> { _config.LayQ, _config.LayW, _config.LayE, _config.LayA, _config.LayS, _config.LayD };
+
+            // PASS 1: Prioritized Lines (Boundary/Traverse)
+            foreach (ObjectId id in btr)
+            {
+                if (!id.ObjectClass.IsDerivedFrom(RXClass.GetClass(typeof(Autodesk.AutoCAD.DatabaseServices.Line)))) continue;
+
+                Autodesk.AutoCAD.DatabaseServices.Line ln = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(id, OpenMode.ForRead);
+                if (priorityLayers.Contains(ln.Layer))
+                {
+                    if (ln.EndPoint.DistanceTo(target) < _config.SnapTolerance) return ln.EndPoint;
+                    if (ln.StartPoint.DistanceTo(target) < _config.SnapTolerance) return ln.StartPoint;
+                }
+            }
+
+            // PASS 2: Fallback (DBPoints and other lines)
             foreach (ObjectId id in btr)
             {
                 Entity ent = (Entity)tr.GetObject(id, OpenMode.ForRead);
@@ -1921,6 +2050,7 @@ namespace CadastreTools
                     foreach (var s in _currentTraverse.Segments) _traversePath.Add(s.EndPoint);
                     UpdateRunningMisclosure();
                     CalculateArea();
+                    UpdateActiveGuide();
                 }
             } 
         }
