@@ -242,16 +242,8 @@ namespace CadastreTools
                 {
                     TraverseChain tc = new TraverseChain() { ChainIndex = dc.ChainIndex, OriginPoint = new Point3d(dc.OriginX, dc.OriginY, dc.OriginZ) };
                     tc.TextOriginId = Resolve(dc.HandleTxtOrigin, db);
-                    foreach (var ds in dc.Segments)
-                    {
-                        var seg = RebuildSeg(ds, db);
-                        if (!seg.IsBroken) tc.Segments.Add(seg);
-                    }
-                    foreach (var dr in dc.Radiations)
-                    {
-                        var rad = RebuildSeg(dr, db);
-                        if (!rad.IsBroken) tc.Radiations.Add(rad);
-                    }
+                    foreach (var ds in dc.Segments) tc.Segments.Add(RebuildSeg(ds, db));
+                    foreach (var dr in dc.Radiations) tc.Radiations.Add(RebuildSeg(dr, db));
                     list.Add(tc);
                 }
                 return list;
@@ -283,16 +275,8 @@ namespace CadastreTools
                     {
                         TraverseChain tc = new TraverseChain() { ChainIndex = dc.ChainIndex, OriginPoint = new Point3d(dc.OriginX, dc.OriginY, dc.OriginZ) };
                         tc.TextOriginId = Resolve(dc.HandleTxtOrigin, db);
-                        foreach (var ds in dc.Segments)
-                        {
-                            var seg = RebuildSeg(ds, db);
-                            if (!seg.IsBroken) tc.Segments.Add(seg);
-                        }
-                        foreach (var dr in dc.Radiations)
-                        {
-                            var rad = RebuildSeg(dr, db);
-                            if (!rad.IsBroken) tc.Radiations.Add(rad);
-                        }
+                        foreach (var ds in dc.Segments) tc.Segments.Add(RebuildSeg(ds, db));
+                        foreach (var dr in dc.Radiations) tc.Radiations.Add(RebuildSeg(dr, db));
                         list.Add(tc);
                     }
                 }
@@ -332,28 +316,13 @@ namespace CadastreTools
             };
         }
 
-        private static ObjectId Resolve(string h, Database db, Point3d? expectedPos = null)
+        private static ObjectId Resolve(string h, Database db)
         {
             if (string.IsNullOrEmpty(h)) return ObjectId.Null;
             try 
             { 
                 ObjectId id = db.GetObjectId(false, new Handle(Convert.ToInt64(h, 16)), 0);
                 if (id.IsErased) return ObjectId.Null;
-
-                if (expectedPos.HasValue)
-                {
-                    using (var tr = db.TransactionManager.StartOpenCloseTransaction())
-                    {
-                        Entity ent = (Entity)tr.GetObject(id, OpenMode.ForRead);
-                        Point3d actualPos = Point3d.Origin;
-                        if (ent is Autodesk.AutoCAD.DatabaseServices.Line ln) actualPos = ln.StartPoint;
-                        else if (ent is DBText dt) actualPos = dt.Position;
-                        else if (ent is MText mt) actualPos = mt.Location;
-
-                        // If moved more than 1mm, consider the handle stale
-                        if (actualPos.DistanceTo(expectedPos.Value) > 0.001) return ObjectId.Null;
-                    }
-                }
                 return id;
             } 
             catch { return ObjectId.Null; }
@@ -363,8 +332,30 @@ namespace CadastreTools
         {
             Point3d start = new Point3d(d.StartX, d.StartY, d.StartZ);
             Point3d end = new Point3d(d.EndX, d.EndY, d.EndZ);
+            double az = d.RawAzimuth;
+            double dist = d.Distance;
             
-            ObjectId lineId = Resolve(d.HandleLine, db, start);
+            ObjectId lineId = Resolve(d.HandleLine, db);
+
+            // GEOMETRIC HEALING: Update data from DWG if handle is valid but geometry moved
+            if (lineId.IsValid && !lineId.IsErased)
+            {
+                using (var tr = db.TransactionManager.StartOpenCloseTransaction())
+                {
+                    var ln = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(lineId, OpenMode.ForRead);
+                    if (ln.StartPoint.DistanceTo(start) > 0.001 || ln.EndPoint.DistanceTo(end) > 0.001)
+                    {
+                        start = ln.StartPoint;
+                        end = ln.EndPoint;
+                        Vector3d v = end - start;
+                        dist = v.Length;
+                        double rad = Math.Atan2(v.Y, v.X);
+                        double deg = (90.0 - (rad * 180.0 / Math.PI));
+                        while (deg < 0) deg += 360; deg %= 360;
+                        az = double.Parse(CadMath.DegreesToDmsString(deg));
+                    }
+                }
+            }
 
             return new TraverseSegment()
             {
@@ -373,8 +364,8 @@ namespace CadastreTools
                 ToPoint = d.ToPoint,
                 PointNumber = d.PointNumber,
                 ParentStationId = d.ParentStationId,
-                RawAzimuth = d.RawAzimuth,
-                Distance = d.Distance,
+                RawAzimuth = az,
+                Distance = dist,
                 Comment = d.Comment,
                 IsRadiation = d.IsRadiation,
                 StartPoint = start,
@@ -382,8 +373,8 @@ namespace CadastreTools
                 LineId = lineId,
                 TextBrgId = Resolve(d.HandleTxtBrg, db),
                 TextDistId = Resolve(d.HandleTxtDist, db),
-                TextPtId = Resolve(d.HandleTxtPt, db, end),
-                TextCommId = Resolve(d.HandleTxtComm, db, end),
+                TextPtId = Resolve(d.HandleTxtPt, db),
+                TextCommId = Resolve(d.HandleTxtComm, db),
                 IsBroken = lineId.IsNull
             };
         }
@@ -796,32 +787,59 @@ namespace CadastreTools
         {
             if (e.GlobalCommandName == "U" || e.GlobalCommandName == "UNDO" || e.GlobalCommandName == "REDO")
             {
+                if (e.GlobalCommandName == "REDO")
+                {
+                    // For REDO, try to re-link handles before syncing
+                    var doc = AcApp.DocumentManager.MdiActiveDocument;
+                    if (doc != null)
+                    {
+                        foreach (var t in _allTraverses)
+                        {
+                            foreach (var s in t.Segments.Concat(t.Radiations))
+                            {
+                                if (s.IsBroken)
+                                {
+                                    // Try to re-resolve if redo brought it back
+                                    // Use raw Resolve to see if it exists now
+                                    try 
+                                    { 
+                                        ObjectId id = doc.Database.GetObjectId(false, new Handle(Convert.ToInt64(s.LineId.Handle.ToString(), 16)), 0);
+                                        if (id.IsValid && !id.IsErased) { s.LineId = id; s.IsBroken = false; }
+                                    } catch {}
+                                }
+                            }
+                        }
+                    }
+                }
+
                 SyncDatabaseToDrawing();
+                _logView?.Refresh();
+                UpdateRunningMisclosure();
             }
         }
 
         private void SyncDatabaseToDrawing()
         {
             bool changed = false;
-            foreach (var t in _allTraverses.ToList())
+            foreach (var t in _allTraverses)
             {
-                for (int i = t.Segments.Count - 1; i >= 0; i--)
+                foreach (var s in t.Segments)
                 {
-                    var s = t.Segments[i];
-                    if (s.LineId.IsNull || s.LineId.IsErased)
+                    if (!s.IsBroken && (s.LineId.IsNull || s.LineId.IsErased))
                     {
-                        t.Segments.RemoveAt(i);
-                        _logItems.Remove(s);
+                        s.IsBroken = true;
+                        s.LineId = ObjectId.Null;
+                        s.NotifyUpdate();
                         changed = true;
                     }
                 }
-                for (int i = t.Radiations.Count - 1; i >= 0; i--)
+                foreach (var r in t.Radiations)
                 {
-                    var r = t.Radiations[i];
-                    if (r.LineId.IsNull || r.LineId.IsErased)
+                    if (!r.IsBroken && (r.LineId.IsNull || r.LineId.IsErased))
                     {
-                        t.Radiations.RemoveAt(i);
-                        _logItems.Remove(r);
+                        r.IsBroken = true;
+                        r.LineId = ObjectId.Null;
+                        r.NotifyUpdate();
                         changed = true;
                     }
                 }
@@ -831,7 +849,6 @@ namespace CadastreTools
             {
                 SyncCurrentState();
                 SaveState();
-                RefreshTraverseList();
                 if (lblStatus != null) lblStatus.Content = "Database synced after Undo/Redo.";
             }
         }
@@ -1167,6 +1184,7 @@ namespace CadastreTools
                             Autodesk.AutoCAD.DatabaseServices.Line ln = new Autodesk.AutoCAD.DatabaseServices.Line(seg.StartPoint, seg.EndPoint);
                             ln.Layer = _currentLayer;
                             seg.LineId = AddToDb(ln, btr, tr);
+                            seg.IsBroken = false; // HEALED
                         }
 
                         // 2. Annotations (Brg/Dist)
@@ -1183,8 +1201,10 @@ namespace CadastreTools
                             }
 
                             double rad = (90.0 - CadMath.ParseDmsToDegrees(seg.RawAzimuth)) * (Math.PI / 180.0);
-                            EraseId(seg.TextBrgId, tr); 
-                            EraseId(seg.TextDistId, tr);
+                            
+                            // Cleanup any existing IDs that might be "ghosts"
+                            if (seg.TextBrgId.IsValid) EraseId(seg.TextBrgId, tr); 
+                            if (seg.TextDistId.IsValid) EraseId(seg.TextDistId, tr);
 
                             var ids = CreateAnnotatedText(btr, tr, lnObj, seg.RawAzimuth, seg.Distance, rad);
                             seg.TextBrgId = ids[0];
@@ -1194,6 +1214,7 @@ namespace CadastreTools
                         // 3. Point Number
                         if (seg.TextPtId.IsNull || seg.TextPtId.IsErased)
                         {
+                            if (seg.TextPtId.IsValid) EraseId(seg.TextPtId, tr);
                             Entity ptTxt = CreateText(seg.PointNumber.ToString(), CadConstants.LAY_TXT_PTNUM, seg.EndPoint, AttachmentPoint.BottomLeft, tr, doc.Database, _config.TextPt);
                             seg.TextPtId = AddToDb(ptTxt, btr, tr);
                         }
@@ -1201,9 +1222,12 @@ namespace CadastreTools
                         // 4. Comment
                         if ((seg.TextCommId.IsNull || seg.TextCommId.IsErased) && !string.IsNullOrEmpty(seg.Comment))
                         {
+                             if (seg.TextCommId.IsValid) EraseId(seg.TextCommId, tr);
                              Entity txt = CreateText(seg.Comment, CadConstants.LAY_TXT_SYMB, seg.EndPoint, AttachmentPoint.MiddleLeft, tr, doc.Database, _config.TextComm);
                              seg.TextCommId = AddToDb(txt, btr, tr);
                         }
+                        
+                        seg.NotifyUpdate();
                     }
 
                     // Process Radiations
@@ -1214,6 +1238,7 @@ namespace CadastreTools
                             Autodesk.AutoCAD.DatabaseServices.Line ln = new Autodesk.AutoCAD.DatabaseServices.Line(radSeg.StartPoint, radSeg.EndPoint);
                             ln.Layer = _currentLayer;
                             radSeg.LineId = AddToDb(ln, btr, tr);
+                            radSeg.IsBroken = false; // HEALED
                         }
 
                         if (radSeg.TextBrgId.IsNull || radSeg.TextBrgId.IsErased || radSeg.TextDistId.IsNull || radSeg.TextDistId.IsErased)
@@ -1225,8 +1250,9 @@ namespace CadastreTools
                                 lnObj = new Autodesk.AutoCAD.DatabaseServices.Line(radSeg.StartPoint, radSeg.EndPoint);
 
                             double radAngle = (90.0 - CadMath.ParseDmsToDegrees(radSeg.RawAzimuth)) * (Math.PI / 180.0);
-                            EraseId(radSeg.TextBrgId, tr);
-                            EraseId(radSeg.TextDistId, tr);
+                            
+                            if (radSeg.TextBrgId.IsValid) EraseId(radSeg.TextBrgId, tr);
+                            if (radSeg.TextDistId.IsValid) EraseId(radSeg.TextDistId, tr);
 
                             var ids = CreateAnnotatedText(btr, tr, lnObj, radSeg.RawAzimuth, radSeg.Distance, radAngle);
                             radSeg.TextBrgId = ids[0];
@@ -1235,15 +1261,19 @@ namespace CadastreTools
 
                         if (radSeg.TextPtId.IsNull || radSeg.TextPtId.IsErased)
                         {
+                            if (radSeg.TextPtId.IsValid) EraseId(radSeg.TextPtId, tr);
                             Entity ptTxt = CreateText(radSeg.PointNumber.ToString(), CadConstants.LAY_TXT_PTNUM, radSeg.EndPoint, AttachmentPoint.BottomLeft, tr, doc.Database, _config.TextPt);
                             radSeg.TextPtId = AddToDb(ptTxt, btr, tr);
                         }
 
                         if ((radSeg.TextCommId.IsNull || radSeg.TextCommId.IsErased) && !string.IsNullOrEmpty(radSeg.Comment))
                         {
+                             if (radSeg.TextCommId.IsValid) EraseId(radSeg.TextCommId, tr);
                              Entity txt = CreateText(radSeg.Comment, CadConstants.LAY_TXT_SYMB, radSeg.EndPoint, AttachmentPoint.MiddleLeft, tr, doc.Database, _config.TextComm);
                              radSeg.TextCommId = AddToDb(txt, btr, tr);
                         }
+                        
+                        radSeg.NotifyUpdate();
                     }
                 }
                 tr.Commit();
