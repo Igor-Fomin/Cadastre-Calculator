@@ -1202,13 +1202,10 @@ namespace CadastreTools
             header.ColumnDefinitions.Add(new ColumnDefinition() { Width = GridLength.Auto });
             header.ColumnDefinitions.Add(new ColumnDefinition() { Width = GridLength.Auto });
             header.ColumnDefinitions.Add(new ColumnDefinition() { Width = GridLength.Auto });
-            header.ColumnDefinitions.Add(new ColumnDefinition() { Width = GridLength.Auto });
             TextBlock title = new TextBlock() { Text = " CADASTRE PRO", VerticalAlignment = VerticalAlignment.Center, Foreground = System.Windows.Media.Brushes.White, FontWeight = FontWeights.Bold, FontSize = 18, Margin = new Thickness(10, 0, 0, 0) };
-            Wpf.Button btnReload = new Wpf.Button() { Content = "↻", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.Cyan, BorderThickness = new Thickness(0), FontSize = 24, ToolTip = "Reload Database from XML", FontWeight = FontWeights.Bold };
-            btnReload.Click += (s, e) => ReloadDataFromDwg();
-
-            Wpf.Button btnSync = new Wpf.Button() { Content = "🔄", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.Orange, BorderThickness = new Thickness(0), FontSize = 24, ToolTip = "Smart Sync: Reconcile Drawing and Database", FontWeight = FontWeights.Bold };
-            btnSync.Click += SmartReconcile_Click;
+            
+            Wpf.Button btnSmartSync = new Wpf.Button() { Content = "🔄", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.Orange, BorderThickness = new Thickness(0), FontSize = 24, ToolTip = "Smart Sync: Reload database, heal geometry, and fix labels", FontWeight = FontWeights.Bold };
+            btnSmartSync.Click += UnifiedSmartSync_Click;
 
             Wpf.Button btnConnect = new Wpf.Button() { Content = "🔗", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.LimeGreen, BorderThickness = new Thickness(0), FontSize = 20, ToolTip = "Connect Database File" };
             btnConnect.Click += ConnectDatabase_Click;
@@ -1216,8 +1213,8 @@ namespace CadastreTools
             btnSettings.Click += (s, e) => ShowSettingsOverlay();
             Wpf.Button btnAbout = new Wpf.Button() { Content = "?", Width = 40, Height = 40, Margin = new Thickness(5), Background = System.Windows.Media.Brushes.Transparent, Foreground = System.Windows.Media.Brushes.White, BorderThickness = new Thickness(0), FontSize = 20 };
             btnAbout.Click += (s, e) => System.Windows.MessageBox.Show("Cadastre Pro V3.5\nData Persistence Active");
-            Grid.SetColumn(title, 0); Grid.SetColumn(btnReload, 1); Grid.SetColumn(btnSync, 2); Grid.SetColumn(btnConnect, 3); Grid.SetColumn(btnSettings, 4); Grid.SetColumn(btnAbout, 5);
-            header.Children.Add(title); header.Children.Add(btnReload); header.Children.Add(btnSync); header.Children.Add(btnConnect); header.Children.Add(btnSettings); header.Children.Add(btnAbout);
+            Grid.SetColumn(title, 0); Grid.SetColumn(btnSmartSync, 1); Grid.SetColumn(btnConnect, 2); Grid.SetColumn(btnSettings, 3); Grid.SetColumn(btnAbout, 4);
+            header.Children.Add(title); header.Children.Add(btnSmartSync); header.Children.Add(btnConnect); header.Children.Add(btnSettings); header.Children.Add(btnAbout);
             Grid.SetRow(header, 0); mainGrid.Children.Add(header);
 
             // INPUTS
@@ -1443,24 +1440,56 @@ namespace CadastreTools
             }
         }
 
-        private void SmartReconcile_Click(object sender, RoutedEventArgs e)
+        private void UnifiedSmartSync_Click(object sender, RoutedEventArgs e)
         {
             var doc = AcApp.DocumentManager.MdiActiveDocument;
             if (doc == null) return;
+
+            // Phase 1: Reload Database
+            ReloadDataFromDwg();
 
             using (DocumentLock loc = doc.LockDocument())
             using (Transaction tr = doc.TransactionManager.StartTransaction())
             {
                 BlockTableRecord btr = (BlockTableRecord)tr.GetObject(doc.Database.CurrentSpaceId, OpenMode.ForWrite);
 
-                // Step 1: Deep Cleanup (Heal) - Sync DB from Drawing (Source of Truth)
+                // Phase 2: Deep Cleanup (Remove orphans)
+                HashSet<ObjectId> validIds = new HashSet<ObjectId>();
+                foreach (var chain in _allTraverses)
+                {
+                    if (chain.TextOriginId.IsValid) validIds.Add(chain.TextOriginId);
+                    foreach (var seg in chain.Segments.Concat(chain.Radiations))
+                    {
+                        if (seg.LineId.IsValid) validIds.Add(seg.LineId);
+                        if (seg.TextBrgId.IsValid) validIds.Add(seg.TextBrgId);
+                        if (seg.TextDistId.IsValid) validIds.Add(seg.TextDistId);
+                        if (seg.TextPtId.IsValid) validIds.Add(seg.TextPtId);
+                        if (seg.TextCommId.IsValid) validIds.Add(seg.TextCommId);
+                    }
+                }
+
+                var layersToClean = new[] { CadConstants.LAY_TXT_BRG, CadConstants.LAY_TXT_DIST, CadConstants.LAY_TXT_PTNUM };
+                foreach (ObjectId id in btr)
+                {
+                    if (id.IsErased) continue;
+                    Entity ent = (Entity)tr.GetObject(id, OpenMode.ForRead);
+                    if (layersToClean.Contains(ent.Layer))
+                    {
+                        if (!validIds.Contains(id))
+                        {
+                            ent.UpgradeOpen();
+                            ent.Erase();
+                        }
+                    }
+                }
+
+                // Phase 3: Geometric Sync (Update DB from Drawing)
                 foreach (var chain in _allTraverses)
                 {
                     foreach (var seg in chain.Segments.Concat(chain.Radiations))
                     {
                         if (seg.LineId.IsValid && !seg.LineId.IsErased)
                         {
-                            // Check coords against DB
                             var ln = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(seg.LineId, OpenMode.ForRead);
                             
                             // Update DB if different
@@ -1480,44 +1509,29 @@ namespace CadastreTools
                     }
                 }
 
-                // Step 2: Ghost Erasure - Remove associated text entities
+                // Phase 4: Full Redraft (Erase valid texts and Regenerate)
                 foreach (var chain in _allTraverses)
                 {
+                    // Erase old valid texts to ensure no duplication/overlap
+                    EraseId(chain.TextOriginId, tr); chain.TextOriginId = ObjectId.Null;
+
                     foreach (var seg in chain.Segments.Concat(chain.Radiations))
                     {
-                        EraseId(seg.TextBrgId, tr);
-                        EraseId(seg.TextDistId, tr);
-                        EraseId(seg.TextPtId, tr);
-                        EraseId(seg.TextCommId, tr);
-                        
-                        // Clear IDs in memory so they are regenerated
-                        seg.TextBrgId = ObjectId.Null;
-                        seg.TextDistId = ObjectId.Null;
-                        seg.TextPtId = ObjectId.Null;
-                        seg.TextCommId = ObjectId.Null;
+                        EraseId(seg.TextBrgId, tr); seg.TextBrgId = ObjectId.Null;
+                        EraseId(seg.TextDistId, tr); seg.TextDistId = ObjectId.Null;
+                        EraseId(seg.TextPtId, tr); seg.TextPtId = ObjectId.Null;
+                        EraseId(seg.TextCommId, tr); seg.TextCommId = ObjectId.Null;
                     }
-                    // Also clean origin text
-                    EraseId(chain.TextOriginId, tr);
-                    chain.TextOriginId = ObjectId.Null;
-                }
 
-                // Step 3: Restore Missing (Redraft)
-                foreach (var chain in _allTraverses)
-                {
                     if (!chain.IsVisible) continue;
 
-                    // Origin Text
-                    if (chain.IsVisible)
-                    {
-                        int startNum = chain.ChainIndex * 1000 + 1;
-                        Entity ptTxt = CreateText(startNum.ToString(), CadConstants.LAY_TXT_PTNUM, chain.OriginPoint, AttachmentPoint.BottomLeft, tr, doc.Database, _config.TextPt);
-                        chain.TextOriginId = AddToDb(ptTxt, btr, tr);
-                    }
+                    // Re-Create Origin
+                    int startNum = chain.ChainIndex * 1000 + 1;
+                    Entity ptTxt = CreateText(startNum.ToString(), CadConstants.LAY_TXT_PTNUM, chain.OriginPoint, AttachmentPoint.BottomLeft, tr, doc.Database, _config.TextPt);
+                    chain.TextOriginId = AddToDb(ptTxt, btr, tr);
 
                     foreach (var seg in chain.Segments.Concat(chain.Radiations))
                     {
-                        if (!chain.IsVisible) continue;
-
                         // Create Line if missing
                         if (seg.LineId.IsNull || seg.LineId.IsErased)
                         {
@@ -1527,16 +1541,20 @@ namespace CadastreTools
                             seg.IsBroken = false;
                         }
 
-                        // Step 4: Fresh Annotation
-                        Autodesk.AutoCAD.DatabaseServices.Line lnObj = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(seg.LineId, OpenMode.ForRead);
-                        
+                        // Annotation
+                        Autodesk.AutoCAD.DatabaseServices.Line lnObj;
+                        if (seg.LineId.IsValid && !seg.LineId.IsErased)
+                            lnObj = (Autodesk.AutoCAD.DatabaseServices.Line)tr.GetObject(seg.LineId, OpenMode.ForRead);
+                        else
+                             lnObj = new Autodesk.AutoCAD.DatabaseServices.Line(seg.StartPoint, seg.EndPoint); // Fallback, shouldn't happen due to block above
+
                         double rad = (90.0 - CadMath.ParseDmsToDegrees(seg.RawAzimuth)) * (Math.PI / 180.0);
                         var ids = CreateAnnotatedText(btr, tr, lnObj, seg.RawAzimuth, seg.Distance, rad);
                         seg.TextBrgId = ids[0];
                         seg.TextDistId = ids[1];
 
-                        Entity ptTxt = CreateText(seg.PointNumber.ToString(), CadConstants.LAY_TXT_PTNUM, seg.EndPoint, AttachmentPoint.BottomLeft, tr, doc.Database, _config.TextPt);
-                        seg.TextPtId = AddToDb(ptTxt, btr, tr);
+                        Entity segPtTxt = CreateText(seg.PointNumber.ToString(), CadConstants.LAY_TXT_PTNUM, seg.EndPoint, AttachmentPoint.BottomLeft, tr, doc.Database, _config.TextPt);
+                        seg.TextPtId = AddToDb(segPtTxt, btr, tr);
 
                         if (!string.IsNullOrEmpty(seg.Comment))
                         {
@@ -1555,7 +1573,8 @@ namespace CadastreTools
             // Persistence
             SaveState();
             SyncCurrentState();
-            if (lblStatus != null) lblStatus.Content = "Smart Sync Complete.";
+            _logView.Refresh();
+            if (lblStatus != null) lblStatus.Content = "Database Reloaded & Drawing Synchronized.";
         }
 
         private void ConnectDatabase_Click(object sender, RoutedEventArgs e)
